@@ -1,0 +1,1 @@
+"""Decoder-only transformer assembly."""

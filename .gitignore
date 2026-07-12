@@ -203,6 +203,12 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Local training artifacts
+/checkpoints/
+/data/
+/runs/
+/wandb/
+
 # Ruff stuff:
 .ruff_cache/
 
