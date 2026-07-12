@@ -1,10 +1,11 @@
 """Architecture contract for the initial package scaffold."""
 
 from importlib import import_module
+from pathlib import Path
 
 import pytest
 
-PUBLIC_MODULES = (
+EXPECTED_IMPORTS = (
     "llmfs.config",
     "llmfs.data.tokenizer",
     "llmfs.data.prepare",
@@ -35,9 +36,32 @@ PUBLIC_MODULES = (
     "llmfs.generate.sampling",
     "llmfs.generate.generate",
     "llmfs.distributed.ddp",
+    "scripts.data.prepare_fineweb",
+    "scripts.train.debug",
+    "scripts.train.tiny",
+    "scripts.train.small",
+    "scripts.train.medium",
+    "scripts.train.model_350m",
+    "scripts.evaluate.checkpoint",
 )
 
+EXPECTED_PATHS = (
+    "src/integration_tests/overfit_one_batch_test.py",
+    "src/integration_tests/checkpoint_resume_test.py",
+    "src/integration_tests/tiny_convergence_test.py",
+    "tools/inspect_shard.py",
+    "tools/inspect_checkpoint.py",
+    "tools/benchmark_attention.py",
+)
 
-@pytest.mark.parametrize("module_name", PUBLIC_MODULES)
-def test_public_module_is_importable(module_name: str) -> None:
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("module_name", EXPECTED_IMPORTS)
+def test_scaffold_module_is_importable(module_name: str) -> None:
     import_module(module_name)
+
+
+@pytest.mark.parametrize("relative_path", EXPECTED_PATHS)
+def test_scaffold_path_exists(relative_path: str) -> None:
+    assert (REPO_ROOT / relative_path).is_file()

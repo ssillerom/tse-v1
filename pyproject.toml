@@ -5,10 +5,7 @@ description = "An educational, from-scratch decoder-only transformer in PyTorch"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "datasets>=5.0.0",
-    "python-dotenv>=1.2.2",
     "torch>=2.13.0",
-    "wandb>=0.28.0",
 ]
 
 [dependency-groups]
