@@ -128,13 +128,24 @@ def test_inspection_forwards_data_dir_to_hugging_face(
         ("shard_size", 0, "shard_size must be positive"),
         ("min_chars", -1, "min_chars cannot be negative"),
         ("log_every_docs", 0, "log_every_docs must be positive"),
+        ("max_docs", 0, "max_docs must be positive"),
+        (
+            "validation_ratio",
+            -0.1,
+            "validation_ratio must be greater than or equal to 0 and less than 1",
+        ),
+        (
+            "validation_ratio",
+            1.0,
+            "validation_ratio must be greater than or equal to 0 and less than 1",
+        ),
     ],
 )
 def test_prepare_rejects_invalid_limits_before_loading_the_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     invalid_argument: str,
-    invalid_value: int,
+    invalid_value: int | float,
     message: str,
 ) -> None:
     def fail_if_called(**kwargs: object) -> tuple[()]:
@@ -179,7 +190,7 @@ def test_prepare_writes_a_reproducible_manifest(
 
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert manifest == {
-        "format_version": 1,
+        "format_version": 2,
         "dataset": {
             "path": "example/dataset",
             "name": None,
@@ -187,6 +198,12 @@ def test_prepare_writes_a_reproducible_manifest(
             "split": "train",
             "revision": "fixed-revision",
             "text_field": "text",
+        },
+        "limits": {"max_docs": None, "max_tokens": 10},
+        "partitioning": {
+            "seed": 42,
+            "strategy": "none",
+            "validation_ratio": 0.0,
         },
         "tokenizer": {"encoding": "gpt2", "eot_token": 50256},
         "storage": {"dtype": "uint16", "shard_size": 10},
@@ -198,9 +215,93 @@ def test_prepare_writes_a_reproducible_manifest(
             "docs_skipped": 2,
             "docs_truncated": 0,
         },
-        "shards": [{"file": "shard_0000.bin", "tokens": 2}],
+        "splits": {
+            "train": {
+                "docs_truncated": 0,
+                "docs_used": 1,
+                "shards": 1,
+                "tokens": 2,
+            }
+        },
+        "shards": [{"file": "shard_0000.bin", "split": "train", "tokens": 2}],
     }
     assert received_arguments["revision"] == "fixed-revision"
+
+
+def test_prepare_limits_documents_and_creates_a_deterministic_validation_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    documents = [{"text": f"document number {index}"} for index in range(100)]
+
+    def fake_load_dataset(**kwargs: object) -> list[dict[str, str]]:
+        del kwargs
+        return documents
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+    output_dirs = [tmp_path / "first", tmp_path / "second"]
+
+    for output_dir in output_dirs:
+        prepare_streaming_dataset(
+            output_dir=output_dir,
+            dataset_name="example/dataset",
+            text_field="text",
+            num_tokens=10_000,
+            shard_size=20,
+            max_docs=50,
+            validation_ratio=0.2,
+            split_seed=7,
+        )
+
+    first_manifest = json.loads((output_dirs[0] / "manifest.json").read_text())
+    second_manifest = json.loads((output_dirs[1] / "manifest.json").read_text())
+
+    assert first_manifest == second_manifest
+    assert first_manifest["counts"]["docs_seen"] == 50
+    assert first_manifest["counts"]["docs_used"] == 50
+    assert first_manifest["partitioning"] == {
+        "seed": 7,
+        "strategy": "content_hash",
+        "validation_ratio": 0.2,
+    }
+    assert first_manifest["splits"]["train"]["docs_used"] > 0
+    assert first_manifest["splits"]["validation"]["docs_used"] > 0
+
+    for shard in first_manifest["shards"]:
+        relative_path = Path(shard["file"])
+        assert relative_path.parts[0] == shard["split"]
+        assert (output_dirs[0] / relative_path).exists()
+        assert (output_dirs[0] / relative_path).read_bytes() == (
+            output_dirs[1] / relative_path
+        ).read_bytes()
+
+
+def test_prepare_preserves_the_source_split_without_partitioning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_load_dataset(**kwargs: object) -> list[dict[str, str]]:
+        del kwargs
+        return [{"text": "hello"}]
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+
+    manifest = prepare_streaming_dataset(
+        output_dir=tmp_path,
+        dataset_name="example/dataset",
+        text_field="text",
+        num_tokens=10,
+        shard_size=10,
+        split="validation",
+    )
+
+    assert manifest["shards"] == [{"file": "shard_0000.bin", "split": "validation", "tokens": 2}]
+    assert manifest["splits"] == {
+        "validation": {
+            "docs_truncated": 0,
+            "docs_used": 1,
+            "shards": 1,
+            "tokens": 2,
+        }
+    }
 
 
 def test_prepare_preserves_previous_dataset_when_replacement_fails(
@@ -279,6 +380,55 @@ def test_prepare_restores_previous_dataset_when_installation_fails(
     assert not any(path.name.startswith(".prepare-data-") for path in tmp_path.iterdir())
 
 
+def test_prepare_restores_previous_split_dataset_when_installation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_train = tmp_path / "train"
+    old_validation = tmp_path / "validation"
+    old_train.mkdir()
+    old_validation.mkdir()
+    (old_train / "shard_0000.bin").write_bytes(b"old-train")
+    (old_validation / "shard_0000.bin").write_bytes(b"old-validation")
+    old_manifest = tmp_path / "manifest.json"
+    old_manifest.write_text('{"status": "known-good"}')
+
+    def fake_load_dataset(**kwargs: object) -> list[dict[str, str]]:
+        del kwargs
+        return [{"text": f"document {index}"} for index in range(20)]
+
+    real_replace = __import__("os").replace
+
+    def fail_validation_directory_install(source: object, destination: object) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            source_path.parent.name.startswith(".prepare-data-staging-")
+            and source_path.name == "validation"
+            and destination_path == old_validation
+        ):
+            raise OSError("validation directory install failed")
+        real_replace(source, destination)
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+    monkeypatch.setattr("data.prepare_data.os.replace", fail_validation_directory_install)
+
+    with pytest.raises(OSError, match="validation directory install failed"):
+        prepare_streaming_dataset(
+            output_dir=tmp_path,
+            dataset_name="example/dataset",
+            text_field="text",
+            num_tokens=1_000,
+            shard_size=20,
+            validation_ratio=0.5,
+            overwrite=True,
+        )
+
+    assert (old_train / "shard_0000.bin").read_bytes() == b"old-train"
+    assert (old_validation / "shard_0000.bin").read_bytes() == b"old-validation"
+    assert old_manifest.read_text() == '{"status": "known-good"}'
+    assert not any(path.name.startswith(".prepare-data-") for path in tmp_path.iterdir())
+
+
 def test_prepare_cleans_up_after_atomic_manifest_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -324,6 +474,12 @@ def test_cli_exposes_prepare_configuration() -> None:
             "fixed",
             "--encoding",
             "gpt2",
+            "--max-docs",
+            "50",
+            "--validation-ratio",
+            "0.1",
+            "--split-seed",
+            "7",
             "--overwrite",
         ]
     )
@@ -333,8 +489,11 @@ def test_cli_exposes_prepare_configuration() -> None:
         arguments.num_tokens,
         arguments.revision,
         arguments.encoding,
+        arguments.max_docs,
+        arguments.validation_ratio,
+        arguments.split_seed,
         arguments.overwrite,
-    ) == ("prepare", 100, "fixed", "gpt2", True)
+    ) == ("prepare", 100, "fixed", "gpt2", 50, 0.1, 7, True)
 
 
 def test_cli_prepare_executes_with_parsed_arguments(

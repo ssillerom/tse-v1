@@ -1,1 +1,1 @@
-"""Executable experiment recipes and data operations."""
+"""Command-line utilities for the project."""

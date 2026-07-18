@@ -6,6 +6,7 @@ the source, tokenizer, storage format, counters, and generated shards.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from typing import cast
@@ -26,6 +27,7 @@ from datasets import load_dataset  # type: ignore[import-untyped]
 LOGGER = logging.getLogger(__name__)
 UINT16_MAX = int(np.iinfo(np.uint16).max)
 SHARD_FILENAME_PATTERN = re.compile(r"shard_\d{4,}\.bin(?:\.tmp)?\Z")
+GENERATED_DIRECTORY_NAMES = frozenset({"train", "validation"})
 
 
 def _find_generated_artifacts(output_dir: Path) -> list[Path]:
@@ -35,10 +37,14 @@ def _find_generated_artifacts(output_dir: Path) -> list[Path]:
         (
             path
             for path in output_dir.iterdir()
-            if path.is_file()
-            and (
-                SHARD_FILENAME_PATTERN.fullmatch(path.name)
-                or path.name in {"manifest.json", "manifest.json.tmp"}
+            if (
+                path.is_dir()
+                and path.name in GENERATED_DIRECTORY_NAMES
+                or path.is_file()
+                and (
+                    SHARD_FILENAME_PATTERN.fullmatch(path.name)
+                    or path.name in {"manifest.json", "manifest.json.tmp"}
+                )
             )
         ),
         key=lambda path: path.name,
@@ -227,6 +233,8 @@ def _validate_preparation_limits(
     shard_size: int,
     min_chars: int,
     log_every_docs: int,
+    max_docs: int | None,
+    validation_ratio: float,
 ) -> None:
     if num_tokens <= 0:
         raise ValueError("num_tokens must be positive")
@@ -236,6 +244,35 @@ def _validate_preparation_limits(
         raise ValueError("min_chars cannot be negative")
     if log_every_docs <= 0:
         raise ValueError("log_every_docs must be positive")
+    if max_docs is not None and max_docs <= 0:
+        raise ValueError("max_docs must be positive")
+    if not 0.0 <= validation_ratio < 1.0:
+        raise ValueError("validation_ratio must be greater than or equal to 0 and less than 1")
+
+
+def _document_output_split(
+    text: str,
+    source_split: str,
+    validation_ratio: float,
+    split_seed: int,
+) -> str:
+    if validation_ratio == 0.0:
+        return source_split
+
+    hasher = hashlib.blake2b(digest_size=8, person=b"llmfsplit")
+    hasher.update(str(split_seed).encode("ascii"))
+    hasher.update(b"\0")
+    hasher.update(text.encode("utf-8"))
+    digest = hasher.digest()
+    sample = int.from_bytes(digest, byteorder="big") / 2**64
+    return "validation" if sample < validation_ratio else "train"
+
+
+def _remove_artifact(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def _install_staged_artifacts(staging_dir: Path, output_dir: Path) -> None:
@@ -263,7 +300,7 @@ def _install_staged_artifacts(staging_dir: Path, output_dir: Path) -> None:
             installed_paths.append(destination)
     except Exception as installation_error:
         for installed_path in installed_paths:
-            installed_path.unlink(missing_ok=True)
+            _remove_artifact(installed_path)
 
         restore_failures: list[str] = []
         for name in backed_up_names:
@@ -292,23 +329,40 @@ def _prepare_into_staging_directory(
     destination_dir: Path,
     dataset: Iterable[Mapping[str, object]],
     dataset_manifest: Mapping[str, object],
+    source_split: str,
     text_field: str,
     num_tokens: int,
     shard_size: int,
     min_chars: int,
     log_every_docs: int,
+    max_docs: int | None,
+    validation_ratio: float,
+    split_seed: int,
     encoding: tiktoken.Encoding,
     encoding_name: str,
 ) -> dict[str, object]:
-    writer = TokenShardWriter(
-        output_dir=staging_dir,
-        shard_size=shard_size,
-        max_total_tokens=num_tokens,
+    output_splits = (source_split,) if validation_ratio == 0.0 else ("train", "validation")
+    split_output_dirs = (
+        {source_split: staging_dir}
+        if validation_ratio == 0.0
+        else {
+            "train": staging_dir / "train",
+            "validation": staging_dir / "validation",
+        }
     )
+    writers = {
+        split_name: TokenShardWriter(
+            output_dir=split_output_dirs[split_name],
+            shard_size=shard_size,
+        )
+        for split_name in output_splits
+    }
+    split_counts = {split_name: {"docs_used": 0, "docs_truncated": 0} for split_name in writers}
     LOGGER.info("Preparing dataset into %s", destination_dir)
     LOGGER.info(
-        "Target: %s tokens | shard size: %s | encoding: %s",
+        "Target: %s tokens | max documents: %s | shard size: %s | encoding: %s",
         f"{num_tokens:,}",
+        "unlimited" if max_docs is None else f"{max_docs:,}",
         f"{shard_size:,}",
         encoding_name,
     )
@@ -317,9 +371,12 @@ def _prepare_into_staging_directory(
     docs_used = 0
     docs_skipped = 0
     docs_truncated = 0
+    total_tokens = 0
     started_at = time.perf_counter()
 
     for document in dataset:
+        if max_docs is not None and docs_seen >= max_docs:
+            break
         docs_seen += 1
         if text_field not in document:
             raise KeyError(
@@ -333,54 +390,93 @@ def _prepare_into_staging_directory(
 
         tokens = encoding.encode(text, disallowed_special=())
         tokens.append(encoding.eot_token)
-        tokens_added = writer.add_tokens(tokens)
+        output_split = _document_output_split(
+            text,
+            source_split,
+            validation_ratio,
+            split_seed,
+        )
+        writer = writers[output_split]
+        remaining_tokens = num_tokens - total_tokens
+        tokens_added = writer.add_tokens(tokens[:remaining_tokens])
+        total_tokens += tokens_added
         if tokens_added > 0:
             docs_used += 1
+            split_counts[output_split]["docs_used"] += 1
         if tokens_added < len(tokens):
             docs_truncated += 1
+            split_counts[output_split]["docs_truncated"] += 1
 
         if docs_seen % log_every_docs == 0:
             elapsed = time.perf_counter() - started_at
-            tokens_per_second = writer.total_tokens / max(elapsed, 1e-9)
+            tokens_per_second = total_tokens / max(elapsed, 1e-9)
             LOGGER.info(
                 "docs_seen=%s | docs_used=%s | skipped=%s | tokens=%s | tok/s=%s",
                 f"{docs_seen:,}",
                 f"{docs_used:,}",
                 f"{docs_skipped:,}",
-                f"{writer.total_tokens:,}",
+                f"{total_tokens:,}",
                 f"{tokens_per_second:,.0f}",
             )
 
-        if writer.total_tokens >= num_tokens:
+        if total_tokens >= num_tokens:
             break
 
-    writer.flush()
+    for writer in writers.values():
+        writer.flush()
     elapsed = time.perf_counter() - started_at
+    total_tokens = sum(writer.total_tokens for writer in writers.values())
+    total_shards = sum(writer.shard_idx for writer in writers.values())
+    shards: list[dict[str, object]] = []
+    splits: dict[str, object] = {}
+    for split_name, writer in writers.items():
+        relative_directory = Path(".") if validation_ratio == 0.0 else Path(split_name)
+        shards.extend(
+            {
+                "file": str(relative_directory / shard.file),
+                "split": split_name,
+                "tokens": shard.tokens,
+            }
+            for shard in writer.shards
+        )
+        splits[split_name] = {
+            "tokens": writer.total_tokens,
+            "shards": writer.shard_idx,
+            **split_counts[split_name],
+        }
+
     manifest: dict[str, object] = {
-        "format_version": 1,
+        "format_version": 2,
         "dataset": dict(dataset_manifest),
+        "limits": {"max_tokens": num_tokens, "max_docs": max_docs},
+        "partitioning": {
+            "strategy": "none" if validation_ratio == 0.0 else "content_hash",
+            "validation_ratio": validation_ratio,
+            "seed": split_seed,
+        },
         "tokenizer": {
             "encoding": encoding_name,
             "eot_token": encoding.eot_token,
         },
         "storage": {"dtype": "uint16", "shard_size": shard_size},
         "counts": {
-            "tokens": writer.total_tokens,
-            "shards": writer.shard_idx,
+            "tokens": total_tokens,
+            "shards": total_shards,
             "docs_seen": docs_seen,
             "docs_used": docs_used,
             "docs_skipped": docs_skipped,
             "docs_truncated": docs_truncated,
         },
-        "shards": [asdict(shard) for shard in writer.shards],
+        "splits": splits,
+        "shards": shards,
     }
     _write_json_atomic(staging_dir / "manifest.json", manifest)
 
-    tokens_per_second = writer.total_tokens / max(elapsed, 1e-9)
+    tokens_per_second = total_tokens / max(elapsed, 1e-9)
     LOGGER.info(
         "Done: %s tokens in %s shards from %s documents (%.2f h, %s tok/s)",
-        f"{writer.total_tokens:,}",
-        f"{writer.shard_idx:,}",
+        f"{total_tokens:,}",
+        f"{total_shards:,}",
         f"{docs_seen:,}",
         elapsed / 3600,
         f"{tokens_per_second:,.0f}",
@@ -401,11 +497,21 @@ def prepare_streaming_dataset(
     hf_token: bool = False,
     min_chars: int = 0,
     log_every_docs: int = 10_000,
+    max_docs: int | None = None,
+    validation_ratio: float = 0.0,
+    split_seed: int = 42,
     encoding_name: str = "gpt2",
     overwrite: bool = False,
 ) -> dict[str, object]:
     """Stream, tokenize, and transactionally replace a dataset and its manifest."""
-    _validate_preparation_limits(num_tokens, shard_size, min_chars, log_every_docs)
+    _validate_preparation_limits(
+        num_tokens,
+        shard_size,
+        min_chars,
+        log_every_docs,
+        max_docs,
+        validation_ratio,
+    )
 
     encoding = tiktoken.get_encoding(encoding_name)
     if encoding.max_token_value > UINT16_MAX:
@@ -450,11 +556,15 @@ def prepare_streaming_dataset(
             destination_dir=output_path,
             dataset=dataset,
             dataset_manifest=dataset_manifest,
+            source_split=split,
             text_field=text_field,
             num_tokens=num_tokens,
             shard_size=shard_size,
             min_chars=min_chars,
             log_every_docs=log_every_docs,
+            max_docs=max_docs,
+            validation_ratio=validation_ratio,
+            split_seed=split_seed,
             encoding=encoding,
             encoding_name=encoding_name,
         )
@@ -489,6 +599,23 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--shard-size", type=int, default=100_000_000)
     prepare_parser.add_argument("--min-chars", type=int, default=0)
     prepare_parser.add_argument("--log-every-docs", type=int, default=10_000)
+    prepare_parser.add_argument(
+        "--max-docs",
+        type=int,
+        help="Stop after reading this many source documents",
+    )
+    prepare_parser.add_argument(
+        "--validation-ratio",
+        type=float,
+        default=0.0,
+        help="Deterministic fraction of valid documents reserved for validation",
+    )
+    prepare_parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="Seed used by deterministic content-hash partitioning",
+    )
     prepare_parser.add_argument("--encoding", default="gpt2")
     prepare_parser.add_argument(
         "--overwrite",
@@ -532,6 +659,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         hf_token=args.hf_token,
         min_chars=args.min_chars,
         log_every_docs=args.log_every_docs,
+        max_docs=args.max_docs,
+        validation_ratio=args.validation_ratio,
+        split_seed=args.split_seed,
         encoding_name=args.encoding,
         overwrite=args.overwrite,
     )
