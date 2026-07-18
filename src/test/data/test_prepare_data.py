@@ -444,7 +444,7 @@ def test_prepare_cleans_up_after_atomic_manifest_failure(
         real_replace(source, destination)
 
     monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
-    monkeypatch.setattr("data.prepare_data.os.replace", fail_manifest_replace)
+    monkeypatch.setattr("data.manifest.os.replace", fail_manifest_replace)
 
     with pytest.raises(OSError, match="manifest replace failed"):
         prepare_streaming_dataset(

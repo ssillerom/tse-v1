@@ -7,7 +7,6 @@ the source, tokenizer, storage format, counters, and generated shards.
 
 import argparse
 import hashlib
-import json
 import logging
 import os
 import re
@@ -23,6 +22,8 @@ from typing import cast
 import numpy as np
 import tiktoken
 from datasets import load_dataset  # type: ignore[import-untyped]
+
+from .manifest import FORMAT_VERSION, STORAGE_DTYPE, write_manifest
 
 LOGGER = logging.getLogger(__name__)
 UINT16_MAX = int(np.iinfo(np.uint16).max)
@@ -214,18 +215,6 @@ def inspect_dataset(
                 print(f"{key}: {preview!r}")
             else:
                 print(f"{key}: {type(value).__name__} = {value}")
-
-
-def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
-    temporary_path = path.with_suffix(".json.tmp")
-    try:
-        temporary_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary_path, path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
 
 
 def _validate_preparation_limits(
@@ -446,7 +435,7 @@ def _prepare_into_staging_directory(
         }
 
     manifest: dict[str, object] = {
-        "format_version": 2,
+        "format_version": FORMAT_VERSION,
         "dataset": dict(dataset_manifest),
         "limits": {"max_tokens": num_tokens, "max_docs": max_docs},
         "partitioning": {
@@ -458,7 +447,7 @@ def _prepare_into_staging_directory(
             "encoding": encoding_name,
             "eot_token": encoding.eot_token,
         },
-        "storage": {"dtype": "uint16", "shard_size": shard_size},
+        "storage": {"dtype": STORAGE_DTYPE, "shard_size": shard_size},
         "counts": {
             "tokens": total_tokens,
             "shards": total_shards,
@@ -470,7 +459,7 @@ def _prepare_into_staging_directory(
         "splits": splits,
         "shards": shards,
     }
-    _write_json_atomic(staging_dir / "manifest.json", manifest)
+    write_manifest(staging_dir / "manifest.json", manifest)
 
     tokens_per_second = total_tokens / max(elapsed, 1e-9)
     LOGGER.info(

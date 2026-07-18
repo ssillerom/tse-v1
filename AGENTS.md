@@ -21,7 +21,8 @@ Do not claim that model training is available until a tested model and trainer e
 ## Repository map
 
 - `src/data/prepare_data.py`: streaming preparation, tokenization, partitioning, atomic publish.
-- `src/data/dataset.py`: manifest validation and memory-mapped causal sequences.
+- `src/data/manifest.py`: manifest v2 serialization, validation, and shard confinement.
+- `src/data/dataset.py`: memory-mapped causal sequences and global indexing.
 - `src/scripts/inspect_slices.py`: human-facing inspection CLI.
 - `src/test/data/`: public-interface tests for the data path.
 - `docs/adr/`: accepted architectural decisions.

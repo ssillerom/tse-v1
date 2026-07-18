@@ -1,13 +1,13 @@
 """Memory-mapped dataset for causal language-model pretraining."""
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+from .manifest import ManifestShard, load_manifest
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,6 @@ class PretrainingDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         split: str,
         seq_len: int,
     ) -> None:
-
         self.split = split
 
         # TODO 1: validar seq_len.
@@ -37,67 +36,9 @@ class PretrainingDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len <= 0:
             raise ValueError(f"seq_len must be a positive integer, got {seq_len!r}")
 
-        # TODO 2: convertir manifest_path en Path y comprobar que existe.
-        self.manifest_path = Path(manifest_path)
-        if not self.manifest_path.is_file():
-            raise FileNotFoundError(f"Manifest file not found: {self.manifest_path}")
-
-        # TODO 3: cargar el JSON.
-        self.manifest_data = self._load_manifest(self.manifest_path)
-
-        # TODO 4: validar versión, dtype y existencia del split.
-        format_version = self.manifest_data.get("format_version")
-        if format_version != 2:
-            raise ValueError(f"Unsupported manifest format_version: {format_version}")
-
-        storage = self.manifest_data.get("storage")
-
-        if not isinstance(storage, dict):
-            raise ValueError("Manifest must contain a storage object")
-
-        dtype = storage.get("dtype")
-
-        if dtype != "uint16":
-            raise ValueError(f"Unsupported storage dtype: {dtype!r}")
-
-        splits = self.manifest_data.get("splits")
-
-        if not isinstance(splits, dict):
-            raise ValueError("Manifest must contain a splits object")
-
-        if self.split not in splits:
-            available_splits = ", ".join(sorted(splits))
-
-            raise ValueError(
-                f"Split {self.split!r} not found. Available splits: {available_splits}"
-            )
-
-        # TODO 5: filtrar los shards pertenecientes al split.
-        raw_shards = self.manifest_data.get("shards")
-
-        if not isinstance(raw_shards, list):
-            raise ValueError("Manifest must contain a shards list")
-
-        split_entries: list[dict[str, Any]] = []
-        for position, entry in enumerate(raw_shards):
-            if not isinstance(entry, dict):
-                raise ValueError(f"Shard entry at position {position} is not an object")
-            if entry.get("split") == self.split:
-                split_entries.append(entry)
-
-        if not split_entries:
-            raise ValueError(f"No shards found for split {self.split!r}")
-
-        self.shard_entries = split_entries
-
-        # TODO 6: abrir y validar cada shard con _open_shard().
-        self.shards = [
-            self._open_shard(
-                manifest_directory=self.manifest_path.parent,
-                entry=entry,
-            )
-            for entry in split_entries
-        ]
+        manifest = load_manifest(manifest_path)
+        split_shards = manifest.shards_for_split(split)
+        self.shards = [self._open_shard(shard) for shard in split_shards]
 
         # TODO 7: construir el índice acumulativo de secuencias.
         sequence_counts = np.array(
@@ -141,65 +82,20 @@ class PretrainingDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
     def _open_shard(
         self,
-        manifest_directory: Path,
-        entry: dict[str, Any],
+        shard: ManifestShard,
     ) -> ShardIndex:
-        """Resolve, validate and memory-map one manifest shard."""
-        # TODO:
-        # - Resolver entry["file"] respecto al directorio del manifest.
-        # - Comprobar que el fichero existe.
-        # - Leer entry["tokens"].
-        # - Comprobar su tamaño en bytes.
-        # - Abrirlo con np.memmap.
-        # - Calcular sequence_count.
-        # - Devolver ShardIndex.
-
-        file_path = entry.get("file")
-
-        if not isinstance(file_path, str) or not file_path:
-            raise ValueError("Shard entry must contain a non-empty 'file' string")
-
-        relative_path = Path(file_path)
-
-        if relative_path.is_absolute():
-            raise ValueError(f"Shard path must be relative: {file_path!r}")
-
-        dataset_directory = manifest_directory.resolve()
-        shard_path = (dataset_directory / relative_path).resolve()
-
-        if not shard_path.is_relative_to(dataset_directory):
-            raise ValueError(f"Shard path escapes the dataset directory: {file_path!r}")
-
-        if not shard_path.is_file():
-            raise FileNotFoundError(f"Shard file not found: {shard_path}")
-
-        token_count = entry.get("tokens")
-
-        if not isinstance(token_count, int) or isinstance(token_count, bool) or token_count <= 0:
-            raise ValueError(f"Invalid token count for shard {shard_path}: {token_count!r}")
-
-        bytes_per_token = np.dtype(np.uint16).itemsize
-        expected_bytes = token_count * bytes_per_token
-        actual_bytes = shard_path.stat().st_size
-
-        if actual_bytes != expected_bytes:
-            raise ValueError(
-                f"Shard {shard_path} declares {token_count} tokens "
-                f"and should contain {expected_bytes} bytes, "
-                f"but contains {actual_bytes} bytes"
-            )
-
+        """Memory-map one already validated manifest shard."""
         tokens = np.memmap(
-            shard_path,
+            shard.path,
             dtype=np.uint16,
             mode="r",
         )
 
-        sequence_count = (token_count - 1) // self.seq_len
+        sequence_count = (shard.token_count - 1) // self.seq_len
 
         return ShardIndex(
-            path=shard_path,
-            token_count=token_count,
+            path=shard.path,
+            token_count=shard.token_count,
             sequence_count=sequence_count,
             tokens=tokens,
         )
@@ -210,18 +106,3 @@ class PretrainingDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         previous_total = 0 if shard_index == 0 else int(self.cumulative_sequences[shard_index - 1])
         local_index = index - previous_total
         return shard_index, local_index
-
-    @staticmethod
-    def _load_manifest(path: Path) -> dict[str, Any]:
-        """Load and minimally validate a prepared-data manifest."""
-
-        text = path.read_text(encoding="utf-8")
-
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse manifest JSON: {e} in {path}") from e
-        if not isinstance(payload, dict):
-            raise ValueError(f"Manifest JSON of {path} must be an object")
-
-        return payload

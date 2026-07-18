@@ -12,7 +12,7 @@ El pipeline de datos ya permite:
 - tokenizar documentos con una codificación de `tiktoken` compatible con `uint16`;
 - limitar una preparación por documentos y tokens;
 - separar train y validation mediante un hash de contenido reproducible;
-- publicar shards y manifest de forma transaccional;
+- validar y publicar shards y manifest de forma transaccional;
 - cargar shards mediante `numpy.memmap`;
 - producir pares `(input_ids, targets)` para causal language modeling;
 - inspeccionar las ventanas como IDs y texto decodificado.
