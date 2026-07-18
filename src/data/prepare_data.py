@@ -23,7 +23,7 @@ import numpy as np
 import tiktoken
 from datasets import load_dataset  # type: ignore[import-untyped]
 
-from .manifest import FORMAT_VERSION, STORAGE_DTYPE, write_manifest
+from src.data.manifest import FORMAT_VERSION, STORAGE_DTYPE, write_manifest
 
 LOGGER = logging.getLogger(__name__)
 UINT16_MAX = int(np.iinfo(np.uint16).max)

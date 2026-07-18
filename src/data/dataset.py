@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .manifest import ManifestShard, load_manifest
+from src.data.manifest import ManifestShard, load_manifest
 
 
 @dataclass(frozen=True)
