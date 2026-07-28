@@ -276,10 +276,27 @@ def test_train_runs_accumulated_steps_with_scheduling_and_evaluation() -> None:
     assert not torch.equal(model.token_embedding.weight, embedding_before)
 
 
-def test_train_resume_matches_an_uninterrupted_deterministic_run() -> None:
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "mps",
+            marks=pytest.mark.skipif(
+                not torch.backends.mps.is_available(),
+                reason="MPS is not available",
+            ),
+        ),
+    ],
+)
+def test_train_resume_matches_an_uninterrupted_deterministic_run(
+    device: str,
+) -> None:
     torch.manual_seed(42)
-    uninterrupted_model = _tiny_model(dropout=0.2)
-    resumed_model = _tiny_model(dropout=0.2)
+    if device == "mps":
+        torch.mps.manual_seed(42)
+    uninterrupted_model = _tiny_model(dropout=0.2).to(device)
+    resumed_model = _tiny_model(dropout=0.2).to(device)
     resumed_model.load_state_dict(uninterrupted_model.state_dict())
     uninterrupted_optimizer = torch.optim.AdamW(
         uninterrupted_model.parameters(),
@@ -319,32 +336,40 @@ def test_train_resume_matches_an_uninterrupted_deterministic_run() -> None:
         max_grad_norm=1.0,
     )
     initial_training_rng_state = torch.random.get_rng_state()
+    initial_mps_rng_state = torch.mps.get_rng_state() if device == "mps" else None
 
     train(
         model=uninterrupted_model,
         optimizer=uninterrupted_optimizer,
         train_batches=loader,
         config=config,
-        device="cpu",
+        device=device,
     )
     torch.random.set_rng_state(initial_training_rng_state)
+    if initial_mps_rng_state is not None:
+        torch.mps.set_rng_state(initial_mps_rng_state)
     first_segment = train(
         model=resumed_model,
         optimizer=resumed_optimizer,
         train_batches=loader,
         config=config,
-        device="cpu",
+        device=device,
         end_step=2,
     )
     checkpoint_rng_state = torch.random.get_rng_state()
+    checkpoint_mps_rng_state = torch.mps.get_rng_state() if device == "mps" else None
     torch.rand(10)
+    if device == "mps":
+        torch.rand(10, device="mps")
     torch.random.set_rng_state(checkpoint_rng_state)
+    if checkpoint_mps_rng_state is not None:
+        torch.mps.set_rng_state(checkpoint_mps_rng_state)
     second_segment = train(
         model=resumed_model,
         optimizer=resumed_optimizer,
         train_batches=loader,
         config=config,
-        device="cpu",
+        device=device,
         start_step=2,
     )
 
@@ -356,8 +381,8 @@ def test_train_resume_matches_an_uninterrupted_deterministic_run() -> None:
         strict=True,
     ):
         torch.testing.assert_close(
-            resumed_parameter,
-            uninterrupted_parameter,
+            resumed_parameter.detach().cpu(),
+            uninterrupted_parameter.detach().cpu(),
             rtol=0.0,
             atol=0.0,
         )

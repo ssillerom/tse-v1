@@ -152,6 +152,7 @@ def _batch_iterator_at_step(
 
     cpu_rng_state = torch.random.get_rng_state()
     cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    mps_rng_state = torch.mps.get_rng_state() if torch.backends.mps.is_available() else None
     try:
         batch_iterator = iter(batches)
         for _ in range(completed_steps * grad_accum_steps):
@@ -161,6 +162,8 @@ def _batch_iterator_at_step(
         torch.random.set_rng_state(cpu_rng_state)
         if cuda_rng_states is not None:
             torch.cuda.set_rng_state_all(cuda_rng_states)
+        if mps_rng_state is not None:
+            torch.mps.set_rng_state(mps_rng_state)
 
 
 def train(

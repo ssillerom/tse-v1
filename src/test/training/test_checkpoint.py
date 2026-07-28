@@ -216,3 +216,33 @@ def test_checkpoint_rejects_a_stored_step_beyond_the_training_horizon(
             optimizer=optimizer,
             training_config=training_config,
         )
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="MPS is not available",
+)
+def test_checkpoint_restores_mps_random_state(tmp_path: Path) -> None:
+    torch.mps.manual_seed(123)
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=1)
+    checkpoint_path = save_checkpoint(
+        path=tmp_path / "checkpoint.pt",
+        model=model,
+        optimizer=optimizer,
+        step=0,
+        training_config=training_config,
+    )
+    expected_random_values = torch.rand(4, device="mps").cpu()
+    torch.rand(10, device="mps")
+
+    load_checkpoint(
+        path=checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        training_config=training_config,
+    )
+    restored_random_values = torch.rand(4, device="mps").cpu()
+
+    torch.testing.assert_close(restored_random_values, expected_random_values)

@@ -40,6 +40,7 @@ def save_checkpoint(
         "step": step,
         "torch_rng_state": torch.random.get_rng_state(),
         "cuda_rng_states": (torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None),
+        "mps_rng_state": (torch.mps.get_rng_state() if torch.backends.mps.is_available() else None),
         "model_config": asdict(model.config),
         "training_config": asdict(training_config),
     }
@@ -119,5 +120,11 @@ def load_checkpoint(
         ):
             raise ValueError("checkpoint contains invalid cuda_rng_states")
         torch.cuda.set_rng_state_all(cuda_rng_states)
+
+    mps_rng_state = payload.get("mps_rng_state")
+    if mps_rng_state is not None and torch.backends.mps.is_available():
+        if not isinstance(mps_rng_state, torch.Tensor):
+            raise ValueError("checkpoint contains an invalid mps_rng_state")
+        torch.mps.set_rng_state(mps_rng_state.cpu())
 
     return step
