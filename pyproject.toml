@@ -43,4 +43,4 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
-files = ["src/data", "src/scripts"]
+files = ["src/data", "src/scripts", "src/training"]

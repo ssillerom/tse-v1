@@ -1,0 +1,253 @@
+"""Training loop primitives for the V1 language model."""
+
+import math
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from numbers import Real
+
+import torch
+
+from src.model.gpt import GPT
+
+from .scheduler import get_learning_rate
+
+Batch = tuple[torch.Tensor, torch.Tensor]
+
+
+def _validate_max_grad_norm(max_grad_norm: object) -> None:
+    if (
+        not isinstance(max_grad_norm, Real)
+        or isinstance(max_grad_norm, bool)
+        or not math.isfinite(float(max_grad_norm))
+        or max_grad_norm <= 0
+    ):
+        raise ValueError(f"max_grad_norm must be finite and positive, got {max_grad_norm!r}")
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    """Configuration for a finite pretraining run."""
+
+    max_steps: int
+    grad_accum_steps: int = 1
+    warmup_steps: int = 0
+    max_learning_rate: float = 3e-4
+    min_learning_rate: float = 3e-5
+    max_grad_norm: float = 1.0
+    eval_interval: int | None = None
+    eval_batches: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.grad_accum_steps, int)
+            or isinstance(self.grad_accum_steps, bool)
+            or self.grad_accum_steps <= 0
+        ):
+            raise ValueError(
+                f"grad_accum_steps must be a positive integer, got {self.grad_accum_steps!r}"
+            )
+        _validate_max_grad_norm(self.max_grad_norm)
+        if self.eval_interval is not None and (
+            not isinstance(self.eval_interval, int)
+            or isinstance(self.eval_interval, bool)
+            or self.eval_interval <= 0
+        ):
+            raise ValueError(
+                f"eval_interval must be a positive integer, got {self.eval_interval!r}"
+            )
+        if self.eval_batches is not None and (
+            not isinstance(self.eval_batches, int)
+            or isinstance(self.eval_batches, bool)
+            or self.eval_batches <= 0
+        ):
+            raise ValueError(f"eval_batches must be a positive integer, got {self.eval_batches!r}")
+
+        get_learning_rate(
+            step=0,
+            warmup_steps=self.warmup_steps,
+            max_steps=self.max_steps,
+            max_learning_rate=self.max_learning_rate,
+            min_learning_rate=self.min_learning_rate,
+        )
+
+
+@dataclass(frozen=True)
+class StepMetrics:
+    """Observable metrics produced by one completed optimizer update."""
+
+    step: int
+    loss: float
+    gradient_norm: float
+    learning_rate: float
+    validation_loss: float | None = None
+
+
+def evaluate(
+    model: GPT,
+    batches: Iterable[Batch],
+    device: torch.device | str,
+    max_batches: int | None = None,
+) -> float:
+    """Return token-weighted mean loss without changing the caller's model mode."""
+    if max_batches is not None and (
+        not isinstance(max_batches, int) or isinstance(max_batches, bool) or max_batches <= 0
+    ):
+        raise ValueError(f"max_batches must be a positive integer, got {max_batches!r}")
+
+    was_training = model.training
+    model.eval()
+    total_loss = 0.0
+    total_targets = 0
+
+    try:
+        with torch.no_grad():
+            for batch_index, (input_ids, targets) in enumerate(batches):
+                if max_batches is not None and batch_index >= max_batches:
+                    break
+
+                input_ids = input_ids.to(device)
+                targets = targets.to(device)
+                _, loss = model(input_ids, targets)
+                if loss is None:
+                    raise RuntimeError("model did not return a loss for an evaluation batch")
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"evaluation loss is not finite: {loss.item()}")
+
+                target_count = int((targets != -100).sum().item())
+                total_loss += loss.item() * target_count
+                total_targets += target_count
+    finally:
+        model.train(was_training)
+
+    if total_targets == 0:
+        raise ValueError("evaluation batches contain no target tokens")
+    return total_loss / total_targets
+
+
+def train(
+    model: GPT,
+    optimizer: torch.optim.Optimizer,
+    train_batches: Iterable[Batch],
+    config: TrainingConfig,
+    device: torch.device | str,
+    validation_batches: Iterable[Batch] | None = None,
+    start_step: int = 0,
+) -> tuple[StepMetrics, ...]:
+    """Train until ``config.max_steps`` and return metrics for completed steps."""
+    if (
+        not isinstance(start_step, int)
+        or isinstance(start_step, bool)
+        or not 0 <= start_step <= config.max_steps
+    ):
+        raise ValueError(
+            f"start_step must be between 0 and max_steps={config.max_steps}, got {start_step!r}"
+        )
+    if config.eval_interval is not None and validation_batches is None:
+        raise ValueError("validation_batches are required when eval_interval is configured")
+
+    batch_iterator = iter(train_batches)
+    history: list[StepMetrics] = []
+
+    for step_index in range(start_step, config.max_steps):
+        microbatches: list[Batch] = []
+        while len(microbatches) < config.grad_accum_steps:
+            try:
+                microbatches.append(next(batch_iterator))
+            except StopIteration:
+                batch_iterator = iter(train_batches)
+                try:
+                    microbatches.append(next(batch_iterator))
+                except StopIteration as error:
+                    raise ValueError("train_batches must contain at least one batch") from error
+
+        learning_rate = get_learning_rate(
+            step=step_index,
+            warmup_steps=config.warmup_steps,
+            max_steps=config.max_steps,
+            max_learning_rate=config.max_learning_rate,
+            min_learning_rate=config.min_learning_rate,
+        )
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = learning_rate
+
+        loss, gradient_norm = train_step(
+            model=model,
+            optimizer=optimizer,
+            microbatches=microbatches,
+            max_grad_norm=config.max_grad_norm,
+            device=device,
+        )
+        completed_step = step_index + 1
+        validation_loss = None
+        if (
+            validation_batches is not None
+            and config.eval_interval is not None
+            and completed_step % config.eval_interval == 0
+        ):
+            validation_loss = evaluate(
+                model=model,
+                batches=validation_batches,
+                device=device,
+                max_batches=config.eval_batches,
+            )
+
+        history.append(
+            StepMetrics(
+                step=completed_step,
+                loss=loss,
+                gradient_norm=gradient_norm,
+                learning_rate=learning_rate,
+                validation_loss=validation_loss,
+            )
+        )
+
+    return tuple(history)
+
+
+def train_step(
+    model: GPT,
+    optimizer: torch.optim.Optimizer,
+    microbatches: Sequence[Batch],
+    max_grad_norm: float,
+    device: torch.device | str,
+) -> tuple[float, float]:
+    """Run one optimizer update over one or more accumulated microbatches."""
+    if not microbatches:
+        raise ValueError("microbatches must contain at least one batch")
+    _validate_max_grad_norm(max_grad_norm)
+
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    accumulated_loss = 0.0
+    target_counts = [int((targets != -100).sum().item()) for _, targets in microbatches]
+    total_targets = sum(target_counts)
+    if total_targets == 0:
+        raise ValueError("microbatches contain no target tokens")
+
+    for (input_ids, targets), target_count in zip(
+        microbatches,
+        target_counts,
+        strict=True,
+    ):
+        input_ids = input_ids.to(device)
+        targets = targets.to(device)
+        _, loss = model(input_ids, targets)
+        if loss is None:
+            raise RuntimeError("model did not return a loss for a training batch")
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"training loss is not finite: {loss.item()}")
+
+        loss_weight = target_count / total_targets
+        (loss * loss_weight).backward()
+        accumulated_loss += loss.item() * loss_weight
+
+    gradient_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(),
+        max_norm=max_grad_norm,
+    )
+    gradient_norm_value = gradient_norm.item()
+    if not math.isfinite(gradient_norm_value):
+        raise FloatingPointError(f"gradient norm is not finite: {gradient_norm_value}")
+
+    optimizer.step()
+    return accumulated_loss, gradient_norm_value

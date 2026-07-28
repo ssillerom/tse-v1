@@ -1,0 +1,61 @@
+import pytest
+
+from training.scheduler import get_learning_rate
+
+
+@pytest.mark.parametrize(
+    ("step", "expected_learning_rate"),
+    [
+        (0, 0.1),
+        (1, 0.55),
+        (2, 1.0),
+        (6, 0.55),
+        (10, 0.1),
+        (12, 0.1),
+    ],
+)
+def test_learning_rate_uses_linear_warmup_then_cosine_decay(
+    step: int,
+    expected_learning_rate: float,
+) -> None:
+    learning_rate = get_learning_rate(
+        step=step,
+        warmup_steps=2,
+        max_steps=10,
+        max_learning_rate=1.0,
+        min_learning_rate=0.1,
+    )
+
+    assert learning_rate == pytest.approx(expected_learning_rate)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"step": -1}, "step must be a non-negative integer"),
+        ({"warmup_steps": -1}, "warmup_steps must be a non-negative integer"),
+        ({"max_steps": 0}, "max_steps must be a positive integer"),
+        ({"warmup_steps": 11}, "warmup_steps cannot exceed max_steps"),
+        ({"max_learning_rate": float("inf")}, "max_learning_rate must be finite and positive"),
+        ({"min_learning_rate": -0.1}, "min_learning_rate must be finite and non-negative"),
+        (
+            {"max_learning_rate": 0.1, "min_learning_rate": 0.2},
+            "min_learning_rate cannot exceed max_learning_rate",
+        ),
+    ],
+)
+def test_learning_rate_rejects_invalid_schedules(
+    arguments: dict[str, int | float],
+    message: str,
+) -> None:
+    valid_arguments: dict[str, int | float] = {
+        "step": 0,
+        "warmup_steps": 2,
+        "max_steps": 10,
+        "max_learning_rate": 1.0,
+        "min_learning_rate": 0.1,
+    }
+    valid_arguments.update(arguments)
+
+    with pytest.raises(ValueError, match=message):
+        get_learning_rate(**valid_arguments)  # type: ignore[arg-type]
