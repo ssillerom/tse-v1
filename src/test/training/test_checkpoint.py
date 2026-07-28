@@ -167,3 +167,52 @@ def test_checkpoint_rejects_a_different_training_configuration(
             optimizer=optimizer,
             training_config=different_training_config,
         )
+
+
+def test_checkpoint_rejects_a_step_beyond_the_training_horizon(
+    tmp_path: Path,
+) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=1)
+
+    with pytest.raises(
+        ValueError,
+        match="step cannot exceed training_config.max_steps",
+    ):
+        save_checkpoint(
+            path=tmp_path / "checkpoint.pt",
+            model=model,
+            optimizer=optimizer,
+            step=2,
+            training_config=training_config,
+        )
+
+
+def test_checkpoint_rejects_a_stored_step_beyond_the_training_horizon(
+    tmp_path: Path,
+) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=1)
+    checkpoint_path = save_checkpoint(
+        path=tmp_path / "checkpoint.pt",
+        model=model,
+        optimizer=optimizer,
+        step=1,
+        training_config=training_config,
+    )
+    payload = torch.load(checkpoint_path, weights_only=True)
+    payload["step"] = 2
+    torch.save(payload, checkpoint_path)
+
+    with pytest.raises(
+        ValueError,
+        match="checkpoint step cannot exceed training_config.max_steps",
+    ):
+        load_checkpoint(
+            path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            training_config=training_config,
+        )

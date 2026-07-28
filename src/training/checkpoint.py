@@ -24,6 +24,11 @@ def save_checkpoint(
     """Atomically save the state required to resume training."""
     if not isinstance(step, int) or isinstance(step, bool) or step < 0:
         raise ValueError(f"step must be a non-negative integer, got {step!r}")
+    if step > training_config.max_steps:
+        raise ValueError(
+            "step cannot exceed training_config.max_steps, "
+            f"got {step} > {training_config.max_steps}"
+        )
 
     checkpoint_path = Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,6 +101,11 @@ def load_checkpoint(
     if saved_training_config != asdict(training_config):
         raise ValueError(
             "checkpoint training_config does not match the current training configuration"
+        )
+    if step > training_config.max_steps:
+        raise ValueError(
+            "checkpoint step cannot exceed training_config.max_steps, "
+            f"got {step} > {training_config.max_steps}"
         )
 
     model.load_state_dict(cast(dict[str, torch.Tensor], model_state))

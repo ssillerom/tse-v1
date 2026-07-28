@@ -9,7 +9,7 @@ from model.gpt import GPT
 from training.trainer import TrainingConfig, evaluate, train, train_step
 
 
-def _tiny_model() -> GPT:
+def _tiny_model(dropout: float = 0.0) -> GPT:
     return GPT(
         ModelConfig(
             vocab_size=8,
@@ -17,7 +17,7 @@ def _tiny_model() -> GPT:
             n_layers=2,
             n_heads=4,
             max_seq_len=6,
-            dropout=0.0,
+            dropout=dropout,
         )
     )
 
@@ -278,8 +278,8 @@ def test_train_runs_accumulated_steps_with_scheduling_and_evaluation() -> None:
 
 def test_train_resume_matches_an_uninterrupted_deterministic_run() -> None:
     torch.manual_seed(42)
-    uninterrupted_model = _tiny_model()
-    resumed_model = _tiny_model()
+    uninterrupted_model = _tiny_model(dropout=0.2)
+    resumed_model = _tiny_model(dropout=0.2)
     resumed_model.load_state_dict(uninterrupted_model.state_dict())
     uninterrupted_optimizer = torch.optim.AdamW(
         uninterrupted_model.parameters(),
@@ -318,6 +318,7 @@ def test_train_resume_matches_an_uninterrupted_deterministic_run() -> None:
         min_learning_rate=1e-3,
         max_grad_norm=1.0,
     )
+    initial_training_rng_state = torch.random.get_rng_state()
 
     train(
         model=uninterrupted_model,
@@ -326,6 +327,7 @@ def test_train_resume_matches_an_uninterrupted_deterministic_run() -> None:
         config=config,
         device="cpu",
     )
+    torch.random.set_rng_state(initial_training_rng_state)
     first_segment = train(
         model=resumed_model,
         optimizer=resumed_optimizer,
@@ -334,6 +336,9 @@ def test_train_resume_matches_an_uninterrupted_deterministic_run() -> None:
         device="cpu",
         end_step=2,
     )
+    checkpoint_rng_state = torch.random.get_rng_state()
+    torch.rand(10)
+    torch.random.set_rng_state(checkpoint_rng_state)
     second_segment = train(
         model=resumed_model,
         optimizer=resumed_optimizer,
@@ -380,4 +385,15 @@ def test_train_rejects_a_one_shot_batch_iterator() -> None:
             train_batches=batch_iterator,
             config=TrainingConfig(max_steps=1),
             device="cpu",
+        )
+
+
+def test_training_config_rejects_eval_batches_without_an_interval() -> None:
+    with pytest.raises(
+        ValueError,
+        match="eval_batches requires eval_interval",
+    ):
+        TrainingConfig(
+            max_steps=1,
+            eval_batches=1,
         )

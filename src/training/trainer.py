@@ -61,6 +61,8 @@ class TrainingConfig:
             or self.eval_batches <= 0
         ):
             raise ValueError(f"eval_batches must be a positive integer, got {self.eval_batches!r}")
+        if self.eval_batches is not None and self.eval_interval is None:
+            raise ValueError("eval_batches requires eval_interval")
 
         get_learning_rate(
             step=0,
@@ -140,6 +142,27 @@ def _next_batch(
             raise ValueError("train_batches must contain at least one batch") from error
 
 
+def _batch_iterator_at_step(
+    batches: Iterable[Batch],
+    completed_steps: int,
+    grad_accum_steps: int,
+) -> Iterator[Batch]:
+    if completed_steps == 0:
+        return iter(batches)
+
+    cpu_rng_state = torch.random.get_rng_state()
+    cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        batch_iterator = iter(batches)
+        for _ in range(completed_steps * grad_accum_steps):
+            _, batch_iterator = _next_batch(batches, batch_iterator)
+        return batch_iterator
+    finally:
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+
+
 def train(
     model: GPT,
     optimizer: torch.optim.Optimizer,
@@ -181,11 +204,14 @@ def train(
     if validation_batches is not None and isinstance(validation_batches, Iterator):
         raise ValueError("validation_batches must be reiterable, not a one-shot iterator")
 
-    batch_iterator = iter(train_batches)
     history: list[StepMetrics] = []
-    if start_step < effective_end_step:
-        for _ in range(start_step * config.grad_accum_steps):
-            _, batch_iterator = _next_batch(train_batches, batch_iterator)
+    if start_step == effective_end_step:
+        return ()
+    batch_iterator = _batch_iterator_at_step(
+        batches=train_batches,
+        completed_steps=start_step,
+        grad_accum_steps=config.grad_accum_steps,
+    )
 
     for step_index in range(start_step, effective_end_step):
         microbatches: list[Batch] = []
