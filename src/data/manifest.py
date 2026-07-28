@@ -23,12 +23,21 @@ class ManifestShard:
 
 
 @dataclass(frozen=True)
+class ManifestTokenizer:
+    """Tokenizer metadata required to decode and evaluate model outputs."""
+
+    encoding_name: str
+    eot_token_id: int
+
+
+@dataclass(frozen=True)
 class DataManifest:
     """Validated manifest metadata needed by dataset consumers."""
 
     path: Path
     shards: tuple[ManifestShard, ...]
     available_splits: frozenset[str]
+    tokenizer: ManifestTokenizer | None
 
     def shards_for_split(self, split: str) -> tuple[ManifestShard, ...]:
         """Return the shards belonging to a declared split."""
@@ -94,6 +103,7 @@ def _validate_manifest(payload: dict[str, Any], manifest_path: Path) -> DataMani
     if not all(isinstance(split, str) for split in raw_splits):
         raise ValueError("Manifest split names must be strings")
     available_splits = frozenset(raw_splits)
+    tokenizer = _validate_tokenizer(payload.get("tokenizer"))
 
     raw_shards = payload.get("shards")
     if not isinstance(raw_shards, list):
@@ -112,6 +122,29 @@ def _validate_manifest(payload: dict[str, Any], manifest_path: Path) -> DataMani
         path=manifest_path,
         shards=shards,
         available_splits=available_splits,
+        tokenizer=tokenizer,
+    )
+
+
+def _validate_tokenizer(raw_tokenizer: object) -> ManifestTokenizer | None:
+    if raw_tokenizer is None:
+        return None
+    if not isinstance(raw_tokenizer, dict):
+        raise ValueError("Manifest tokenizer must be an object")
+
+    encoding_name = raw_tokenizer.get("encoding")
+    if not isinstance(encoding_name, str) or not encoding_name:
+        raise ValueError("Manifest tokenizer must contain a non-empty encoding")
+    eot_token_id = raw_tokenizer.get("eot_token")
+    if (
+        not isinstance(eot_token_id, int)
+        or isinstance(eot_token_id, bool)
+        or not 0 <= eot_token_id <= int(np.iinfo(np.uint16).max)
+    ):
+        raise ValueError("Manifest tokenizer must contain a uint16-compatible eot_token")
+    return ManifestTokenizer(
+        encoding_name=encoding_name,
+        eot_token_id=eot_token_id,
     )
 
 

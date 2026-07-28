@@ -9,11 +9,13 @@ dependencies = [
     "numpy>=2.5.1",
     "tiktoken>=0.13.0",
     "torch>=2.13.0",
+    "wandb>=0.22.0",
 ]
 
 [project.scripts]
 inspect-data-slices = "src.scripts.inspect_slices:main"
 prepare-data = "src.data.prepare_data:main"
+train-v1 = "src.scripts.train_v1:main"
 
 [dependency-groups]
 dev = [

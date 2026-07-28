@@ -1,7 +1,8 @@
 """Training loop primitives for the V1 language model."""
 
 import math
-from collections.abc import Iterable, Iterator, Sequence
+import time
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from numbers import Real
 
@@ -9,6 +10,7 @@ import torch
 
 from src.model.gpt import GPT, IGNORE_INDEX
 
+from .evaluation import perplexity_from_loss
 from .scheduler import get_learning_rate
 
 Batch = tuple[torch.Tensor, torch.Tensor]
@@ -81,7 +83,22 @@ class StepMetrics:
     loss: float
     gradient_norm: float
     learning_rate: float
+    tokens_in_step: int
+    tokens_seen: int
+    step_time_seconds: float
+    tokens_per_second: float
     validation_loss: float | None = None
+    validation_perplexity: float | None = None
+
+    def __post_init__(self) -> None:
+        if (self.validation_loss is None) != (self.validation_perplexity is None):
+            raise ValueError(
+                "validation_loss and validation_perplexity must either both be present "
+                "or both be absent"
+            )
+
+
+StepCallback = Callable[[StepMetrics], None]
 
 
 def evaluate(
@@ -146,24 +163,34 @@ def _batch_iterator_at_step(
     batches: Iterable[Batch],
     completed_steps: int,
     grad_accum_steps: int,
-) -> Iterator[Batch]:
+) -> tuple[Iterator[Batch], int]:
     if completed_steps == 0:
-        return iter(batches)
+        return iter(batches), 0
 
     cpu_rng_state = torch.random.get_rng_state()
     cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     mps_rng_state = torch.mps.get_rng_state() if torch.backends.mps.is_available() else None
     try:
         batch_iterator = iter(batches)
+        tokens_seen = 0
         for _ in range(completed_steps * grad_accum_steps):
-            _, batch_iterator = _next_batch(batches, batch_iterator)
-        return batch_iterator
+            batch, batch_iterator = _next_batch(batches, batch_iterator)
+            tokens_seen += int((batch[1] != IGNORE_INDEX).sum().item())
+        return batch_iterator, tokens_seen
     finally:
         torch.random.set_rng_state(cpu_rng_state)
         if cuda_rng_states is not None:
             torch.cuda.set_rng_state_all(cuda_rng_states)
         if mps_rng_state is not None:
             torch.mps.set_rng_state(mps_rng_state)
+
+
+def _synchronize_device(device: torch.device | str) -> None:
+    resolved_device = torch.device(device)
+    if resolved_device.type == "cuda":
+        torch.cuda.synchronize(resolved_device)
+    elif resolved_device.type == "mps":
+        torch.mps.synchronize()
 
 
 def train(
@@ -175,6 +202,7 @@ def train(
     validation_batches: Iterable[Batch] | None = None,
     start_step: int = 0,
     end_step: int | None = None,
+    on_step: StepCallback | None = None,
 ) -> tuple[StepMetrics, ...]:
     """Train one deterministic segment and return metrics for completed steps.
 
@@ -210,7 +238,7 @@ def train(
     history: list[StepMetrics] = []
     if start_step == effective_end_step:
         return ()
-    batch_iterator = _batch_iterator_at_step(
+    batch_iterator, tokens_seen = _batch_iterator_at_step(
         batches=train_batches,
         completed_steps=start_step,
         grad_accum_steps=config.grad_accum_steps,
@@ -232,6 +260,11 @@ def train(
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = learning_rate
 
+        tokens_in_step = sum(
+            int((targets != IGNORE_INDEX).sum().item()) for _, targets in microbatches
+        )
+        _synchronize_device(device)
+        step_started_at = time.perf_counter()
         loss, gradient_norm = train_step(
             model=model,
             optimizer=optimizer,
@@ -239,8 +272,13 @@ def train(
             max_grad_norm=config.max_grad_norm,
             device=device,
         )
+        _synchronize_device(device)
+        step_time_seconds = time.perf_counter() - step_started_at
+        tokens_seen += tokens_in_step
+        tokens_per_second = tokens_in_step / max(step_time_seconds, 1e-9)
         completed_step = step_index + 1
         validation_loss = None
+        validation_perplexity = None
         if (
             validation_batches is not None
             and config.eval_interval is not None
@@ -252,16 +290,23 @@ def train(
                 device=device,
                 max_batches=config.eval_batches,
             )
+            validation_perplexity = perplexity_from_loss(validation_loss)
 
-        history.append(
-            StepMetrics(
-                step=completed_step,
-                loss=loss,
-                gradient_norm=gradient_norm,
-                learning_rate=learning_rate,
-                validation_loss=validation_loss,
-            )
+        metrics = StepMetrics(
+            step=completed_step,
+            loss=loss,
+            gradient_norm=gradient_norm,
+            learning_rate=learning_rate,
+            tokens_in_step=tokens_in_step,
+            tokens_seen=tokens_seen,
+            step_time_seconds=step_time_seconds,
+            tokens_per_second=tokens_per_second,
+            validation_loss=validation_loss,
+            validation_perplexity=validation_perplexity,
         )
+        history.append(metrics)
+        if on_step is not None:
+            on_step(metrics)
 
     return tuple(history)
 

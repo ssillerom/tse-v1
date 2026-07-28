@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from model.config import ModelConfig
 from model.gpt import GPT
-from training.trainer import TrainingConfig, evaluate, train, train_step
+from training.trainer import StepMetrics, TrainingConfig, evaluate, train, train_step
 
 
 def _tiny_model(dropout: float = 0.0) -> GPT:
@@ -20,6 +20,32 @@ def _tiny_model(dropout: float = 0.0) -> GPT:
             dropout=dropout,
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("validation_loss", "validation_perplexity"),
+    [
+        (1.0, None),
+        (None, 2.0),
+    ],
+)
+def test_step_metrics_requires_validation_loss_and_perplexity_together(
+    validation_loss: float | None,
+    validation_perplexity: float | None,
+) -> None:
+    with pytest.raises(ValueError, match="must either both be present or both be absent"):
+        StepMetrics(
+            step=1,
+            loss=2.0,
+            gradient_norm=0.5,
+            learning_rate=1e-3,
+            tokens_in_step=16,
+            tokens_seen=16,
+            step_time_seconds=0.1,
+            tokens_per_second=160.0,
+            validation_loss=validation_loss,
+            validation_perplexity=validation_perplexity,
+        )
 
 
 def test_train_step_produces_finite_metrics_and_updates_parameters() -> None:
@@ -252,6 +278,7 @@ def test_train_runs_accumulated_steps_with_scheduling_and_evaluation() -> None:
         eval_interval=2,
         eval_batches=1,
     )
+    observed_metrics = []
 
     history = train(
         model=model,
@@ -260,8 +287,10 @@ def test_train_runs_accumulated_steps_with_scheduling_and_evaluation() -> None:
         config=config,
         device="cpu",
         validation_batches=loader,
+        on_step=observed_metrics.append,
     )
 
+    assert observed_metrics == list(history)
     assert [metrics.step for metrics in history] == [1, 2, 3]
     assert [metrics.learning_rate for metrics in history] == [
         pytest.approx(1e-3),
@@ -270,9 +299,16 @@ def test_train_runs_accumulated_steps_with_scheduling_and_evaluation() -> None:
     ]
     assert history[0].validation_loss is None
     assert history[1].validation_loss is not None
+    assert history[0].validation_perplexity is None
+    assert history[1].validation_perplexity == pytest.approx(math.exp(history[1].validation_loss))
+    assert history[2].validation_perplexity is None
     assert history[2].validation_loss is None
     assert all(math.isfinite(metrics.loss) for metrics in history)
     assert all(math.isfinite(metrics.gradient_norm) for metrics in history)
+    assert [metrics.tokens_in_step for metrics in history] == [24, 24, 24]
+    assert [metrics.tokens_seen for metrics in history] == [24, 48, 72]
+    assert all(metrics.step_time_seconds > 0.0 for metrics in history)
+    assert all(metrics.tokens_per_second > 0.0 for metrics in history)
     assert not torch.equal(model.token_embedding.weight, embedding_before)
 
 
@@ -375,6 +411,8 @@ def test_train_resume_matches_an_uninterrupted_deterministic_run(
 
     assert [metrics.step for metrics in first_segment] == [1, 2]
     assert [metrics.step for metrics in second_segment] == [3, 4]
+    assert [metrics.tokens_seen for metrics in first_segment] == [12, 24]
+    assert [metrics.tokens_seen for metrics in second_segment] == [36, 48]
     for uninterrupted_parameter, resumed_parameter in zip(
         uninterrupted_model.parameters(),
         resumed_model.parameters(),

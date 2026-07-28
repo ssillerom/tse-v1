@@ -82,6 +82,43 @@ uv run inspect-data-slices \
 El comando muestra la ventana de `seq_len + 1` tokens, el input, el target desplazado, sus IDs y
 la continuidad entre ventanas consecutivas.
 
+## Entrenar y evaluar V1 con W&B
+
+Autentica W&B una sola vez; la API key no debe guardarse en el repositorio:
+
+```bash
+uv run wandb login
+```
+
+El smoke training predeterminado usa el modelo educativo de 4 capas y evalúa sobre el split
+`validation` del mismo manifest. Registra loss, perplexity, learning rate, gradient norm y una
+tabla periódica con seis continuaciones greedy en inglés. También mide tokens procesados,
+tiempo por step y tokens por segundo sin incluir el coste de evaluación:
+
+```bash
+uv run train-v1 \
+  --manifest data/fineweb-edu-50/manifest.json \
+  --device auto \
+  --max-steps 500 \
+  --eval-interval 50 \
+  --sample-interval 100 \
+  --checkpoint-interval 100 \
+  --wandb-project llm-from-scratch \
+  --wandb-name v1-smoke-001
+```
+
+Los prompts son fijos durante toda la ejecución para poder comparar checkpoints sin introducir
+azar de sampling. La evaluación frecuente usa como máximo `--eval-batches 20`; el checkpoint
+final se guarda incluso si el último step no coincide con el intervalo.
+
+Para probar el flujo completo sin iniciar sesión ni acceder a la red:
+
+```bash
+uv run train-v1 \
+  --manifest data/fineweb-edu-50/manifest.json \
+  --wandb-mode disabled
+```
+
 ## Desarrollo
 
 ```bash

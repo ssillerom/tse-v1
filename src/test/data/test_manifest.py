@@ -30,6 +30,19 @@ def test_manifest_round_trip_exposes_validated_shards(tmp_path: Path) -> None:
     assert json.loads(manifest_path.read_text(encoding="utf-8")) == _manifest_payload()
 
 
+def test_manifest_exposes_tokenizer_metadata_when_declared(tmp_path: Path) -> None:
+    np.asarray([10, 11, 12, 13], dtype=np.uint16).tofile(tmp_path / "train.bin")
+    payload = _manifest_payload()
+    payload["tokenizer"] = {"encoding": "gpt2", "eot_token": 50_256}
+
+    write_manifest(tmp_path / "manifest.json", payload)
+    manifest = load_manifest(tmp_path / "manifest.json")
+
+    assert manifest.tokenizer is not None
+    assert manifest.tokenizer.encoding_name == "gpt2"
+    assert manifest.tokenizer.eot_token_id == 50_256
+
+
 def test_writer_rejects_a_shard_from_an_undeclared_split(tmp_path: Path) -> None:
     np.asarray([10, 11, 12, 13], dtype=np.uint16).tofile(tmp_path / "train.bin")
     payload = _manifest_payload()
