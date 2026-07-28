@@ -25,6 +25,34 @@ def test_gpt_converts_token_sequences_into_vocabulary_logits() -> None:
     assert loss is None
 
 
+def test_gpt_can_use_manual_attention_without_calling_sdpa(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
+        raise RuntimeError("SDPA is unavailable")
+
+    monkeypatch.setattr(
+        torch.nn.functional,
+        "scaled_dot_product_attention",
+        unavailable_sdpa,
+    )
+    config = ModelConfig(
+        vocab_size=32,
+        d_model=16,
+        n_layers=2,
+        n_heads=4,
+        max_seq_len=8,
+        dropout=0.0,
+        use_sdpa=False,
+    )
+    model = GPT(config)
+    input_ids = torch.randint(0, config.vocab_size, (2, 6))
+
+    logits, _ = model(input_ids)
+
+    assert logits.shape == (2, 6, config.vocab_size)
+
+
 def test_gpt_ties_input_and_output_embeddings_when_configured() -> None:
     config = ModelConfig(
         vocab_size=32,

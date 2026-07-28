@@ -23,6 +23,7 @@ class TransformerBlock(nn.Module):
             dropout=config.dropout,
             qkv_bias=config.qkv_bias,
             rope_theta=config.rope_theta,
+            use_sdpa=config.use_sdpa,
         )
 
         self.mlp_norm = RMSNorm(

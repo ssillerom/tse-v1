@@ -17,6 +17,7 @@ class ModelConfig:
     rope_theta: float = 10_000.0
     norm_eps: float = 1e-6
     tie_embeddings: bool = True
+    use_sdpa: bool = True
 
     def __post_init__(self) -> None:
         integer_settings = {
@@ -59,6 +60,8 @@ class ModelConfig:
             raise ValueError(f"qkv_bias must be a boolean, got {self.qkv_bias!r}")
         if not isinstance(self.tie_embeddings, bool):
             raise ValueError(f"tie_embeddings must be a boolean, got {self.tie_embeddings!r}")
+        if not isinstance(self.use_sdpa, bool):
+            raise ValueError(f"use_sdpa must be a boolean, got {self.use_sdpa!r}")
 
     def head_dim(self) -> int:
         """Return the dimension of each attention head."""

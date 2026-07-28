@@ -8,12 +8,10 @@ representaciones aprendidas:
 - Value (V): qué información entrega cada token si recibe atención.
 
 Q, K y V se dividen en cabezas para que existan varios espacios de relación en
-paralelo. RoPE rota Q y K para introducir posición. Después, cada query se
-compara con todas las keys mediante productos escalares; se divide por
-``sqrt(head_dim)`` para estabilizar su escala y la máscara causal prohíbe mirar
-tokens futuros. Softmax produce pesos que suman uno para cada query. Durante el
-entrenamiento se les aplica dropout antes de usarlos para calcular la suma
-ponderada de los values que produce el contexto.
+paralelo. RoPE rota Q y K para introducir posición. La atención puede calcularse
+con PyTorch SDPA, que selecciona un kernel eficiente cuando está disponible, o
+con la implementación manual conservada para aprendizaje. Ambas rutas aplican
+el escalado, la máscara causal, softmax y dropout antes de combinar los values.
 
 Finalmente se reúnen las cabezas y ``W_o`` mezcla sus resultados. La forma de
 salida vuelve a ser ``[batch, tokens, d_model]`` para permitir la conexión
@@ -25,6 +23,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.model.rope import RoPECache, apply_rope
 
@@ -40,7 +39,7 @@ class MultiHeadAttention(nn.Module):
         [batch_size, seq_len, d_model]
     """
 
-    causal_mask: torch.Tensor
+    causal_mask: torch.Tensor | None
 
     def __init__(
         self,
@@ -50,6 +49,7 @@ class MultiHeadAttention(nn.Module):
         dropout: float = 0.0,
         qkv_bias: bool = False,
         rope_theta: float = 10_000.0,
+        use_sdpa: bool = True,
     ) -> None:
         super().__init__()
 
@@ -71,10 +71,14 @@ class MultiHeadAttention(nn.Module):
         if rope_theta <= 0.0:
             raise ValueError(f"rope_theta must be positive, got {rope_theta}")
 
+        if not isinstance(use_sdpa, bool):
+            raise ValueError(f"use_sdpa must be a boolean, got {use_sdpa!r}")
+
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.max_seq_len = max_seq_len
+        self.use_sdpa = use_sdpa
 
         if self.head_dim % 2 != 0:
             raise ValueError(f"head_dim must be even for RoPE, got {self.head_dim}")
@@ -116,15 +120,17 @@ class MultiHeadAttention(nn.Module):
         # Randomly drops attention weights after softmax during training.
         self.attention_dropout = nn.Dropout(dropout)
 
-        # True marca las posiciones futuras que deben ocultarse.
-        causal_mask = torch.triu(
-            torch.ones(
-                max_seq_len,
-                max_seq_len,
-                dtype=torch.bool,
-            ),
-            diagonal=1,
-        )
+        causal_mask = None
+        if not use_sdpa:
+            # True marca las posiciones futuras que debe ocultar la ruta manual.
+            causal_mask = torch.triu(
+                torch.ones(
+                    max_seq_len,
+                    max_seq_len,
+                    dtype=torch.bool,
+                ),
+                diagonal=1,
+            )
 
         # No es un parámetro entrenable, pero se moverá con la capa
         # cuando se utilice CPU, CUDA o MPS.
@@ -203,53 +209,42 @@ class MultiHeadAttention(nn.Module):
         # [batch_size, n_heads, seq_len, head_dim]
 
         # ---------------------------------------------------------
-        # 4. Comparar las queries con las keys
+        # 4. Calcular atención con SDPA o con la ruta manual
         # ---------------------------------------------------------
 
-        attention_scores = q @ k.transpose(-2, -1)
+        if self.use_sdpa:
+            context = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=self.attention_dropout.p if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            attention_scores = q @ k.transpose(-2, -1)
+            attention_scores = attention_scores / math.sqrt(self.head_dim)
 
-        # Forma:
-        # [batch_size, n_heads, seq_len, seq_len]
+            if self.causal_mask is None:
+                raise RuntimeError("Manual attention requires a causal mask")
+            mask = self.causal_mask[:seq_len, :seq_len]
+            attention_scores = attention_scores.masked_fill(
+                mask,
+                -torch.inf,
+            )
 
-        # Evita que el producto escalar crezca demasiado.
-        attention_scores = attention_scores / math.sqrt(self.head_dim)
-
-        # ---------------------------------------------------------
-        # 5. Aplicar la máscara causal
-        # ---------------------------------------------------------
-
-        mask = self.causal_mask[:seq_len, :seq_len]
-
-        attention_scores = attention_scores.masked_fill(
-            mask,
-            -torch.inf,
-        )
-
-        # ---------------------------------------------------------
-        # 6. Convertir las puntuaciones en probabilidades
-        # ---------------------------------------------------------
-
-        attention_weights = torch.softmax(
-            attention_scores,
-            dim=-1,
-        )
-
-        attention_weights = self.attention_dropout(attention_weights)
-
-        # Forma:
-        # [batch_size, n_heads, seq_len, seq_len]
-
-        # ---------------------------------------------------------
-        # 7. Recuperar información de los values
-        # ---------------------------------------------------------
-
-        context = attention_weights @ v
+            attention_weights = torch.softmax(
+                attention_scores,
+                dim=-1,
+            )
+            attention_weights = self.attention_dropout(attention_weights)
+            context = attention_weights @ v
 
         # Forma:
         # [batch_size, n_heads, seq_len, head_dim]
 
         # ---------------------------------------------------------
-        # 8. Volver a unir las cabezas
+        # 5. Volver a unir las cabezas
         # ---------------------------------------------------------
 
         context = context.transpose(1, 2)
@@ -267,7 +262,7 @@ class MultiHeadAttention(nn.Module):
         # [batch_size, seq_len, d_model]
 
         # ---------------------------------------------------------
-        # 9. Mezclar la información de todas las cabezas
+        # 6. Mezclar la información de todas las cabezas
         # ---------------------------------------------------------
 
         output: torch.Tensor = self.W_o(context)

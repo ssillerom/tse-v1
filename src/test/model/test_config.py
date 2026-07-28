@@ -27,6 +27,7 @@ def test_model_config_rejects_dimensions_incompatible_with_attention_and_rope(
         ({"n_heads": 4.0}, "n_heads must be a positive integer"),
         ({"norm_eps": float("nan")}, "norm_eps must be finite and positive"),
         ({"tie_embeddings": "yes"}, "tie_embeddings must be a boolean"),
+        ({"use_sdpa": "yes"}, "use_sdpa must be a boolean"),
     ],
 )
 def test_model_config_rejects_invalid_public_settings(
