@@ -1,8 +1,8 @@
 # LLM from scratch
 
 Proyecto educativo para construir y entrenar un transformer decoder-only desde primeros
-principios con PyTorch. El objetivo actual es completar primero un camino fiable desde texto
-crudo hasta batches causales antes de implementar el modelo y el trainer.
+principios con PyTorch. El repositorio ya cubre el camino desde texto crudo hasta batches
+causales y una primera arquitectura V1 probada; el siguiente objetivo es implementar el trainer.
 
 ## Estado
 
@@ -17,8 +17,12 @@ El pipeline de datos ya permite:
 - producir pares `(input_ids, targets)` para causal language modeling;
 - inspeccionar las ventanas como IDs y texto decodificado.
 
-El modelo transformer, el loop de entrenamiento y los checkpoints todavía están fuera del
-camino ejecutable actual.
+El modelo V1 ya incluye embeddings, bloques Pre-Norm con MHA + RoPE, RMSNorm, SwiGLU, pesos
+compartidos con el `lm_head` y causal cross-entropy. Un smoke test pequeño verifica formas,
+causalidad, gradientes y que el modelo puede sobreajustar un batch dependiente del contexto.
+
+El loop de entrenamiento para datasets preparados, la evaluación y los checkpoints todavía
+están fuera del camino ejecutable actual.
 
 ## Instalación
 
