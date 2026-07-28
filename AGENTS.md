@@ -7,24 +7,35 @@ observable invariants, and small end-to-end proofs over premature scale or optim
 
 ## Current executable scope
 
-The data path is the only complete vertical slice:
+The repository has a tested, single-device training slice:
 
 ```text
 Hugging Face document stream
   -> token shards + manifest v2
   -> memory-mapped fixed-length sequences
   -> PyTorch DataLoader batches
+  -> V1 GPT loss
+  -> accumulated optimizer steps
+  -> evaluation + resumable checkpoints
 ```
 
-Do not claim that model training is available until a tested model and trainer exist.
+This slice proves correctness on small local runs; it is not yet a distributed or production
+training system.
 
 ## Repository map
 
 - `src/data/prepare_data.py`: streaming preparation, tokenization, partitioning, atomic publish.
 - `src/data/manifest.py`: manifest v2 serialization, validation, and shard confinement.
 - `src/data/dataset.py`: memory-mapped causal sequences and global indexing.
+- `src/model/`: V1 decoder-only Transformer components and assembled GPT.
+- `src/training/trainer.py`: scheduled training, token-weighted accumulation, and evaluation.
+- `src/training/scheduler.py`: linear warmup followed by cosine learning-rate decay.
+- `src/training/checkpoint.py`: atomic model, optimizer, config, and RNG checkpoints.
 - `src/scripts/inspect_slices.py`: human-facing inspection CLI.
 - `src/test/data/`: public-interface tests for the data path.
+- `src/test/model/`: component and assembled-model tests.
+- `src/test/training/`: public-interface tests for training behavior.
+- `src/integration_tests/`: small end-to-end learning and resumable-training proofs.
 - `docs/adr/`: accepted architectural decisions.
 - `CONTEXT.md`: canonical data-domain vocabulary.
 
@@ -46,17 +57,18 @@ ADR in the same change.
 
 ```bash
 uv sync --group dev
-uv run pytest -q src/test/data
-uv run ruff format --check src/data src/scripts src/test/data
-uv run ruff check src/data src/scripts src/test/data
+uv run pytest -q
+uv run ruff format --check src
+uv run ruff check src
 uv run mypy
 ```
 
 ## Change discipline
 
-- Test behavior through `prepare_streaming_dataset`, `PretrainingDataset`, and CLI entry points.
+- Test behavior through public data, model, training, checkpoint, and CLI entry points.
 - Use real temporary shard files in tests; do not mock NumPy memmap internals.
 - Keep network access out of the default test suite.
+- Exact data-order replay requires deterministic, reiterable training batches.
 - Preserve unrelated working-tree changes and stage only files in the requested scope.
 - Never commit prepared datasets, model checkpoints, secrets, tokens, or run logs.
 - Prefer explicit validation errors over assertions in production paths.

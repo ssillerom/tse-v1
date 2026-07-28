@@ -121,6 +121,46 @@ def test_train_step_rejects_boolean_gradient_norm_limit() -> None:
         )
 
 
+def test_train_step_skips_a_microbatch_without_target_tokens() -> None:
+    torch.manual_seed(42)
+    accumulated_model = _tiny_model()
+    valid_only_model = _tiny_model()
+    valid_only_model.load_state_dict(accumulated_model.state_dict())
+    accumulated_optimizer = torch.optim.SGD(accumulated_model.parameters(), lr=1e-2)
+    valid_only_optimizer = torch.optim.SGD(valid_only_model.parameters(), lr=1e-2)
+    ignored_batch = (
+        torch.tensor([[0, 1, 2, 3, 4, 5]]),
+        torch.full((1, 6), -100),
+    )
+    valid_batch = (
+        torch.tensor([[1, 2, 3, 4, 5, 6]]),
+        torch.tensor([[2, 3, 4, 5, 6, 7]]),
+    )
+
+    accumulated_loss, _ = train_step(
+        model=accumulated_model,
+        optimizer=accumulated_optimizer,
+        microbatches=[ignored_batch, valid_batch],
+        max_grad_norm=1e6,
+        device="cpu",
+    )
+    valid_only_loss, _ = train_step(
+        model=valid_only_model,
+        optimizer=valid_only_optimizer,
+        microbatches=[valid_batch],
+        max_grad_norm=1e6,
+        device="cpu",
+    )
+
+    assert accumulated_loss == pytest.approx(valid_only_loss)
+    for accumulated_parameter, valid_only_parameter in zip(
+        accumulated_model.parameters(),
+        valid_only_model.parameters(),
+        strict=True,
+    ):
+        torch.testing.assert_close(accumulated_parameter, valid_only_parameter)
+
+
 def test_evaluate_returns_loss_without_gradients_and_restores_training_mode() -> None:
     torch.manual_seed(42)
     model = _tiny_model()
@@ -148,6 +188,32 @@ def test_evaluate_returns_loss_without_gradients_and_restores_training_mode() ->
     assert math.isfinite(validation_loss)
     assert model.training
     assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_evaluate_skips_batches_without_target_tokens() -> None:
+    torch.manual_seed(42)
+    model = _tiny_model()
+    ignored_batch = (
+        torch.tensor([[0, 1, 2, 3, 4, 5]]),
+        torch.full((1, 6), -100),
+    )
+    valid_batch = (
+        torch.tensor([[1, 2, 3, 4, 5, 6]]),
+        torch.tensor([[2, 3, 4, 5, 6, 7]]),
+    )
+
+    mixed_loss = evaluate(
+        model=model,
+        batches=[ignored_batch, valid_batch],
+        device="cpu",
+    )
+    valid_only_loss = evaluate(
+        model=model,
+        batches=[valid_batch],
+        device="cpu",
+    )
+
+    assert mixed_loss == pytest.approx(valid_only_loss)
 
 
 def test_train_runs_accumulated_steps_with_scheduling_and_evaluation() -> None:
@@ -208,3 +274,110 @@ def test_train_runs_accumulated_steps_with_scheduling_and_evaluation() -> None:
     assert all(math.isfinite(metrics.loss) for metrics in history)
     assert all(math.isfinite(metrics.gradient_norm) for metrics in history)
     assert not torch.equal(model.token_embedding.weight, embedding_before)
+
+
+def test_train_resume_matches_an_uninterrupted_deterministic_run() -> None:
+    torch.manual_seed(42)
+    uninterrupted_model = _tiny_model()
+    resumed_model = _tiny_model()
+    resumed_model.load_state_dict(uninterrupted_model.state_dict())
+    uninterrupted_optimizer = torch.optim.AdamW(
+        uninterrupted_model.parameters(),
+        lr=1e-2,
+        weight_decay=0.0,
+    )
+    resumed_optimizer = torch.optim.AdamW(
+        resumed_model.parameters(),
+        lr=1e-2,
+        weight_decay=0.0,
+    )
+    input_ids = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5],
+            [1, 2, 3, 4, 5, 6],
+            [2, 3, 4, 5, 6, 7],
+        ]
+    )
+    targets = torch.tensor(
+        [
+            [1, 2, 3, 4, 5, 6],
+            [2, 3, 4, 5, 6, 7],
+            [3, 4, 5, 6, 7, 0],
+        ]
+    )
+    loader = DataLoader(
+        TensorDataset(input_ids, targets),
+        batch_size=1,
+        shuffle=False,
+    )
+    config = TrainingConfig(
+        max_steps=4,
+        grad_accum_steps=2,
+        warmup_steps=1,
+        max_learning_rate=1e-2,
+        min_learning_rate=1e-3,
+        max_grad_norm=1.0,
+    )
+
+    train(
+        model=uninterrupted_model,
+        optimizer=uninterrupted_optimizer,
+        train_batches=loader,
+        config=config,
+        device="cpu",
+    )
+    first_segment = train(
+        model=resumed_model,
+        optimizer=resumed_optimizer,
+        train_batches=loader,
+        config=config,
+        device="cpu",
+        end_step=2,
+    )
+    second_segment = train(
+        model=resumed_model,
+        optimizer=resumed_optimizer,
+        train_batches=loader,
+        config=config,
+        device="cpu",
+        start_step=2,
+    )
+
+    assert [metrics.step for metrics in first_segment] == [1, 2]
+    assert [metrics.step for metrics in second_segment] == [3, 4]
+    for uninterrupted_parameter, resumed_parameter in zip(
+        uninterrupted_model.parameters(),
+        resumed_model.parameters(),
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            resumed_parameter,
+            uninterrupted_parameter,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+
+def test_train_rejects_a_one_shot_batch_iterator() -> None:
+    model = _tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters())
+    batch_iterator = iter(
+        [
+            (
+                torch.tensor([[0, 1, 2, 3, 4, 5]]),
+                torch.tensor([[1, 2, 3, 4, 5, 6]]),
+            )
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="train_batches must be reiterable",
+    ):
+        train(
+            model=model,
+            optimizer=optimizer,
+            train_batches=batch_iterator,
+            config=TrainingConfig(max_steps=1),
+            device="cpu",
+        )

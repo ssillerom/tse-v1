@@ -14,6 +14,8 @@ from src.model.block import TransformerBlock
 from src.model.config import ModelConfig
 from src.model.rms_norm import RMSNorm
 
+IGNORE_INDEX = -100
+
 
 class GPT(nn.Module):
     """Assemble the V1 decoder-only Transformer."""
@@ -66,6 +68,6 @@ class GPT(nn.Module):
             loss = F.cross_entropy(
                 logits.reshape(-1, self.config.vocab_size),
                 targets.reshape(-1),
-                ignore_index=-100,
+                ignore_index=IGNORE_INDEX,
             )
         return logits, loss

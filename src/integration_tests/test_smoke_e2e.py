@@ -1,12 +1,14 @@
 import math
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from torch.utils.data import DataLoader
 
 from data import prepare_data
 from data.dataset import PretrainingDataset
+from data.manifest import load_manifest
 from model.config import ModelConfig
 from model.gpt import GPT
 from training.checkpoint import load_checkpoint, save_checkpoint
@@ -81,6 +83,17 @@ def test_smoke_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     validation_manifest = validation_data_dir / "manifest.json"
     assert train_manifest.is_file()
     assert validation_manifest.is_file()
+    prepared_manifest = load_manifest(train_manifest)
+    first_train_shard = prepared_manifest.shards_for_split("train")[0]
+    first_document_tokens = np.fromfile(
+        first_train_shard.path,
+        dtype=np.uint16,
+        count=9,
+    )
+    expected_first_document = TinyEncoding().encode(train_documents[0]["text"]) + [
+        TinyEncoding.eot_token
+    ]
+    assert first_document_tokens.tolist() == expected_first_document
 
     sequence_length = 6
     train_dataset = PretrainingDataset(
@@ -128,8 +141,9 @@ def test_smoke_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         weight_decay=0.0,
         betas=(0.9, 0.95),
     )
+    checkpoint_step = 30
     training_config = TrainingConfig(
-        max_steps=30,
+        max_steps=31,
         grad_accum_steps=2,
         warmup_steps=2,
         max_learning_rate=2e-2,
@@ -153,6 +167,7 @@ def test_smoke_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         config=training_config,
         device="cpu",
         validation_batches=validation_loader,
+        end_step=checkpoint_step,
     )
     final_validation_loss = evaluate(
         model=model,
@@ -163,7 +178,7 @@ def test_smoke_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert math.isfinite(initial_validation_loss)
     assert abs(initial_validation_loss - math.log(model_config.vocab_size)) < 0.5
-    assert len(history) == training_config.max_steps
+    assert len(history) == checkpoint_step
     assert all(math.isfinite(metrics.loss) for metrics in history)
     assert all(
         math.isfinite(metrics.gradient_norm) and metrics.gradient_norm > 0.0 for metrics in history
@@ -185,7 +200,7 @@ def test_smoke_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         path=tmp_path / "checkpoints" / "step_000030.pt",
         model=model,
         optimizer=optimizer,
-        step=training_config.max_steps,
+        step=checkpoint_step,
         training_config=training_config,
     )
     restored_model = GPT(model_config)
@@ -199,6 +214,7 @@ def test_smoke_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         path=checkpoint_path,
         model=restored_model,
         optimizer=restored_optimizer,
+        training_config=training_config,
         map_location="cpu",
     )
 
@@ -206,31 +222,25 @@ def test_smoke_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     restored_model.eval()
     expected_logits, _ = model(first_inputs)
     restored_logits, _ = restored_model(first_inputs)
-    assert loaded_step == training_config.max_steps
+    assert loaded_step == checkpoint_step
     torch.testing.assert_close(restored_logits, expected_logits, rtol=0.0, atol=0.0)
 
-    resume_config = TrainingConfig(
-        max_steps=training_config.max_steps + 1,
-        grad_accum_steps=training_config.grad_accum_steps,
-        warmup_steps=training_config.warmup_steps,
-        max_learning_rate=training_config.max_learning_rate,
-        min_learning_rate=training_config.min_learning_rate,
-        max_grad_norm=training_config.max_grad_norm,
-    )
     original_resume_history = train(
         model=model,
         optimizer=optimizer,
         train_batches=train_loader,
-        config=resume_config,
+        config=training_config,
         device="cpu",
+        validation_batches=validation_loader,
         start_step=loaded_step,
     )
     restored_resume_history = train(
         model=restored_model,
         optimizer=restored_optimizer,
         train_batches=train_loader,
-        config=resume_config,
+        config=training_config,
         device="cpu",
+        validation_batches=validation_loader,
         start_step=loaded_step,
     )
 

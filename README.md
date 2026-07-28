@@ -2,7 +2,7 @@
 
 Proyecto educativo para construir y entrenar un transformer decoder-only desde primeros
 principios con PyTorch. El repositorio ya cubre el camino desde texto crudo hasta batches
-causales y una primera arquitectura V1 probada; el siguiente objetivo es implementar el trainer.
+causales, una arquitectura V1 probada y un loop de entrenamiento reanudable.
 
 ## Estado
 
@@ -21,8 +21,11 @@ El modelo V1 ya incluye embeddings, bloques Pre-Norm con MHA + RoPE, RMSNorm, Sw
 compartidos con el `lm_head` y causal cross-entropy. Un smoke test pequeño verifica formas,
 causalidad, gradientes y que el modelo puede sobreajustar un batch dependiente del contexto.
 
-El loop de entrenamiento para datasets preparados, la evaluación y los checkpoints todavía
-están fuera del camino ejecutable actual.
+El módulo de entrenamiento añade AdamW configurable por el llamador, acumulación de gradientes
+ponderada por tokens, gradient clipping, warmup lineal con cosine decay, evaluación periódica y
+checkpoints atómicos que restauran modelo, optimizador, configuración y estado aleatorio. El
+smoke test E2E recorre documentos locales, shards, dataset, entrenamiento, evaluación y
+reanudación sin depender de la red.
 
 ## Instalación
 
@@ -82,9 +85,9 @@ la continuidad entre ventanas consecutivas.
 ## Desarrollo
 
 ```bash
-uv run pytest -q src/test/data
-uv run ruff format --check src/data src/scripts src/test/data
-uv run ruff check src/data src/scripts src/test/data
+uv run pytest -q
+uv run ruff format --check src
+uv run ruff check src
 uv run mypy
 ```
 
@@ -104,6 +107,9 @@ documentos pequeños y escriben shards reales en directorios temporales.
 - Los shards no incluyen todavía checksums ni reanudación de una preparación interrumpida.
 - La tokenización es de un solo proceso.
 - Las secuencias no cruzan fronteras de shard; la cola incompleta de cada shard se descarta.
+- El entrenamiento actual es de un solo dispositivo y no usa mixed precision.
+- La reproducción exacta del orden de datos al reanudar requiere un iterable determinista que
+  pueda reiniciarse; todavía no se guarda el estado de samplers aleatorios o distribuidos.
 - FineWeb-Edu sirve para validar el pipeline en inglés, no como corpus bilingüe final.
 
 Los datasets preparados, checkpoints y logs son artefactos locales y no deben añadirse a Git.

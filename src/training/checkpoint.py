@@ -52,6 +52,7 @@ def load_checkpoint(
     path: str | Path,
     model: GPT,
     optimizer: torch.optim.Optimizer,
+    training_config: TrainingConfig,
     map_location: torch.device | str = "cpu",
 ) -> int:
     """Restore model, optimizer, and random state, then return the completed step."""
@@ -79,6 +80,7 @@ def load_checkpoint(
     optimizer_state = payload.get("optimizer_state")
     torch_rng_state = payload.get("torch_rng_state")
     model_config = payload.get("model_config")
+    saved_training_config = payload.get("training_config")
     if not isinstance(model_state, dict):
         raise ValueError("checkpoint contains an invalid model_state")
     if not isinstance(optimizer_state, dict):
@@ -87,8 +89,14 @@ def load_checkpoint(
         raise ValueError("checkpoint contains an invalid torch_rng_state")
     if not isinstance(model_config, dict):
         raise ValueError("checkpoint contains an invalid model_config")
+    if not isinstance(saved_training_config, dict):
+        raise ValueError("checkpoint contains an invalid training_config")
     if model_config != asdict(model.config):
         raise ValueError("checkpoint model_config does not match the current model configuration")
+    if saved_training_config != asdict(training_config):
+        raise ValueError(
+            "checkpoint training_config does not match the current training configuration"
+        )
 
     model.load_state_dict(cast(dict[str, torch.Tensor], model_state))
     optimizer.load_state_dict(cast(dict[str, object], optimizer_state))

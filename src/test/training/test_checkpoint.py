@@ -68,6 +68,7 @@ def test_checkpoint_restores_training_state_and_can_continue(tmp_path: Path) -> 
         path=checkpoint_path,
         model=restored_model,
         optimizer=restored_optimizer,
+        training_config=training_config,
         map_location="cpu",
     )
     restored_random_values = torch.rand(4)
@@ -137,4 +138,32 @@ def test_checkpoint_rejects_a_different_model_configuration(tmp_path: Path) -> N
             path=checkpoint_path,
             model=incompatible_model,
             optimizer=incompatible_optimizer,
+            training_config=training_config,
+        )
+
+
+def test_checkpoint_rejects_a_different_training_configuration(
+    tmp_path: Path,
+) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    saved_training_config = TrainingConfig(max_steps=4, grad_accum_steps=2)
+    checkpoint_path = save_checkpoint(
+        path=tmp_path / "checkpoint.pt",
+        model=model,
+        optimizer=optimizer,
+        step=2,
+        training_config=saved_training_config,
+    )
+    different_training_config = TrainingConfig(max_steps=4, grad_accum_steps=1)
+
+    with pytest.raises(
+        ValueError,
+        match=("checkpoint training_config does not match the current training configuration"),
+    ):
+        load_checkpoint(
+            path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            training_config=different_training_config,
         )
