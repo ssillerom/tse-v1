@@ -34,4 +34,4 @@ class RMSNorm(nn.Module):
         values = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
         rms = torch.sqrt(torch.mean(values.square(), dim=-1, keepdim=True) + self.eps)
         normalized = values / rms
-        return normalized.to(dtype=input_dtype) * self.gamma
+        return (normalized * self.gamma).to(dtype=input_dtype)
