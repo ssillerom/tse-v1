@@ -33,17 +33,18 @@ repositories during decay.
 | Educational web | FineWeb-Edu Dedup, 9.45B | next 1.05B from the same manifest |
 | Code | Stack v3 permissive Python, 0.75B | — |
 | Mathematics | Nemotron-CC-Math score 3, 0.40B | Nemotron-CC-Math 4plus, 0.10B |
-| Knowledge | Nemotron-CC v2.1 High-Quality, 0.20B | Nemotron Pretraining Fact-Seeking, 0.05B |
+| Knowledge | FineWiki English, 0.20B | Nemotron Pretraining Fact-Seeking, 0.05B |
 | **Total** | **10.80B** | **1.20B** |
 
 The JSON quotas differ from these rounded labels by at most 640 tokens so that every source
 quota is an exact number of 1,024-token sequences.
 
-Before preparing the NVIDIA sources, accept the data agreements on the
-`nvidia/Nemotron-CC-Math-v1` and `nvidia/Nemotron-CC-v2.1` Hub pages, run `hf auth login`,
-and keep `--hf-token` on those commands. The specialized v1.2 corpus is public. Once the
-recipe has passed its pilot, pin each source with `--revision` and keep the generated
-manifests; "latest" is not a reproducible revision.
+Before preparing the NVIDIA mathematics source, accept the data agreement on the
+`nvidia/Nemotron-CC-Math-v1` Hub page, run `hf auth login`, and keep `--hf-token` on those
+commands. FineWiki and the specialized v1.2 corpus are public. The FineWiki command below is
+pinned to the tested August 2025 English snapshot. Before the paid pilot, pin every remaining
+source with `--revision` and keep the generated manifests; "latest" is not a reproducible
+revision.
 
 Prepare slightly more than each training quota because 2% is assigned deterministically to
 validation. The commands below create 100M-token shards and use the same GPT-2 encoding:
@@ -89,12 +90,12 @@ uv run prepare-data prepare \
   --encoding gpt2
 
 uv run prepare-data prepare \
-  --dataset-name nvidia/Nemotron-CC-v2.1 \
-  --name High-Quality \
+  --dataset-name HuggingFaceFW/finewiki \
+  --name en \
+  --revision 8bd13e72e6a002407649b3e898535f42ceb1aeb9 \
   --split train \
   --text-field text \
-  --hf-token \
-  --output-dir data/pretrain-v1/nemotron-knowledge-high-quality \
+  --output-dir data/pretrain-v1/finewiki-en \
   --num-tokens 210000000 \
   --shard-size 100000000 \
   --validation-ratio 0.02 \

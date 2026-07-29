@@ -15,8 +15,8 @@
       "manifest": "../data/pretrain-v1/nemotron-math-3/manifest.json"
     },
     {
-      "name": "nemotron_knowledge",
-      "manifest": "../data/pretrain-v1/nemotron-knowledge-high-quality/manifest.json"
+      "name": "finewiki_en",
+      "manifest": "../data/pretrain-v1/finewiki-en/manifest.json"
     },
     {
       "name": "nemotron_math_4plus",
@@ -35,7 +35,7 @@
         "fineweb_edu_dedup": 9450000384,
         "stack_v3_python": 750000128,
         "nemotron_math_3": 400000000,
-        "nemotron_knowledge": 199999488
+        "finewiki_en": 199999488
       }
     },
     {

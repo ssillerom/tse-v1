@@ -111,6 +111,7 @@ def test_shipped_12b_recipe_has_exact_sequences_and_only_reuses_deduplicated_web
         (repository_root / "configs" / "pretrain_v1_english_12b.json").read_text(encoding="utf-8")
     )
     stable_phase, decay_phase = payload["phases"]
+    sources_by_name = {source["name"]: source for source in payload["sources"]}
 
     for phase in (stable_phase, decay_phase):
         assert sum(phase["source_tokens"].values()) == phase["tokens"]
@@ -118,3 +119,8 @@ def test_shipped_12b_recipe_has_exact_sequences_and_only_reuses_deduplicated_web
     assert set(stable_phase["source_tokens"]) & set(decay_phase["source_tokens"]) == {
         "fineweb_edu_dedup"
     }
+    assert stable_phase["source_tokens"]["finewiki_en"] == 199_999_488
+    assert sources_by_name["finewiki_en"]["manifest"] == (
+        "../data/pretrain-v1/finewiki-en/manifest.json"
+    )
+    assert "nemotron_knowledge" not in sources_by_name
