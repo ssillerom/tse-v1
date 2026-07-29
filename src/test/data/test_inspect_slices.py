@@ -38,6 +38,10 @@ def test_inspection_decodes_prepared_slices(
             "2",
             "--num-examples",
             "2",
+            "--d-model",
+            "16",
+            "--preview-dims",
+            "4",
         ],
         cwd=repository_root,
         check=False,
@@ -53,3 +57,7 @@ def test_inspection_decodes_prepared_slices(
     assert "'hello world'" in output
     assert "SHIFT VALID: True" in output
     assert "CONTINUES PREVIOUS: True" in output
+    assert "Input batch shape: [2, 2]" in output
+    assert "Embedding shape: [2, 2, 16]" in output
+    assert "Context vectors shape: [2, 2, 16]" in output
+    assert "CONTEXT VECTORS (each token, first 4 dimensions)" in output

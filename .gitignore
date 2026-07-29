@@ -222,3 +222,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Notebooks
+.ipynb_checkpoints/
+notebooks/*

@@ -1,0 +1,42 @@
+:root {
+  color-scheme: light;
+  --paper: #fbfaf7;
+  --ink: #24211d;
+  --muted: #706a61;
+  --line: #ddd7cd;
+  --accent: #8d3f2b;
+  --code: #f0ece5;
+  --good: #285b43;
+  --warn: #8a5815;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 17px/1.58 Georgia, "Times New Roman", serif;
+}
+main { max-width: 980px; margin: 0 auto; padding: 64px 28px 100px; }
+h1, h2, h3 { line-height: 1.15; font-family: ui-sans-serif, system-ui, sans-serif; }
+h1 { font-size: clamp(2.2rem, 6vw, 4.8rem); letter-spacing: -.055em; margin: 0 0 18px; }
+h2 { margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--line); }
+h3 { margin-top: 36px; }
+p, li { max-width: 76ch; }
+.lede { color: var(--muted); font-size: 1.2rem; }
+.shape-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+.shape-grid div, .callout { border: 1px solid var(--line); padding: 14px 16px; background: #fff; }
+.shape-grid strong { display: block; font: 700 1.1rem ui-monospace, monospace; color: var(--accent); }
+.walk { display: grid; grid-template-columns: minmax(230px, 46%) 1fr; border-top: 1px solid var(--line); }
+.walk > * { margin: 0; padding: 13px 15px; border-bottom: 1px solid var(--line); }
+.walk code, code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.walk pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--code); font-size: .8rem; }
+.line { color: var(--accent); font-weight: 700; }
+.warn { border-left: 5px solid var(--warn); }
+.good { border-left: 5px solid var(--good); }
+.equation { font: 1.05rem ui-monospace, monospace; padding: 18px; background: var(--code); overflow-x: auto; }
+details { border-bottom: 1px solid var(--line); padding: 12px 0; }
+summary { cursor: pointer; font-weight: 700; }
+a { color: var(--accent); }
+@media (max-width: 700px) { .walk { grid-template-columns: 1fr; } main { padding: 36px 18px 72px; } }
+@media print { body { font-size: 11pt; } main { padding: 0; } .walk { break-inside: avoid; } }

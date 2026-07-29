@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Atención, línea a línea</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+<main>
+  <p class="line">LECCIÓN 0001 · PYTORCH</p>
+  <h1>Atención, línea a línea</h1>
+  <p class="lede">Una lectura del archivo adjunto siguiendo el recorrido real del tensor:
+  proyecciones Q/K/V → cabezas → QK-Norm → RoPE → GQA → atención causal → salida.</p>
+
+  <div class="callout good">
+    <strong>Victoria concreta.</strong> Al terminar deberías poder mirar cualquier línea y decir
+    qué forma entra, qué forma sale y qué invariante intenta preservar.
+  </div>
+
+  <h2>0. El mapa que debes mantener en la cabeza</h2>
+  <div class="shape-grid">
+    <div><strong>B</strong>batch size</div>
+    <div><strong>T</strong>sequence length</div>
+    <div><strong>D</strong>d_model</div>
+    <div><strong>H</strong>n_heads</div>
+    <div><strong>Hkv</strong>n_kv_heads</div>
+    <div><strong>d = D/H</strong>dimensión por cabeza</div>
+  </div>
+  <p>Ejemplo de los tests: <code>B=2, T=10, D=512, H=8</code>, de modo que
+  <code>d=64</code>. Con GQA y <code>Hkv=2</code>, cada cabeza K/V sirve a
+  <code>H/Hkv=4</code> cabezas Q.</p>
+  <p class="equation">Attention(Q,K,V) = softmax((QKᵀ)/√d + causal_mask) V</p>
+
+  <h2>1. Imports y definición de MHA · líneas 1–47</h2>
+  <div class="walk">
+    <pre><span class="line">1</span> import math</pre><p>Funciones escalares; en este archivo solo se usa después para inicializar λ en atención diferencial.</p>
+    <pre><span class="line">2</span> import torch</pre><p>API principal de tensores, creación aleatoria, operaciones y autograd.</p>
+    <pre><span class="line">3</span> import torch.nn as nn</pre><p>Capas con estado entrenable: <code>Module</code>, <code>Linear</code>, <code>Dropout</code> y <code>Parameter</code>.</p>
+    <pre><span class="line">4</span> import torch.nn.functional as F</pre><p>Operaciones sin módulo propio: normalización, softmax y scaled dot-product attention.</p>
+    <pre><span class="line">5</span> from .rope import apply_rope, RoPECache</pre><p>Import relativo. El archivo debe formar parte de un paquete. La caché prepara frecuencias; <code>apply_rope</code> rota Q y K.</p>
+    <pre><span class="line">6</span> from .rmsnorm import RMSNorm</pre><p>Importa RMSNorm para la salida de atención diferencial. Atención: en tu repositorio actual el archivo se llama <code>rms_norm.py</code>, no <code>rmsnorm.py</code>.</p>
+    <pre><span class="line">8–11</span> class MultiHeadAttention(nn.Module): …</pre><p>Declara una capa PyTorch. Heredar de <code>nn.Module</code> registra parámetros, permite <code>train/eval</code> y hace callable a la instancia.</p>
+    <pre><span class="line">13–14</span> def __init__(..., use_flash=True,
+use_qk_norm=True, use_xsa=False):</pre><p>Configura dimensión, número de cabezas Q y K/V, dropout, longitud máxima y tres variantes opcionales.</p>
+    <pre><span class="line">15</span> super().__init__()</pre><p>Inicializa la maquinaria interna de <code>nn.Module</code>. Debe ejecutarse antes de asignar submódulos o parámetros.</p>
+    <pre><span class="line">16</span> assert d_model % n_heads == 0</pre><p>Garantiza que D pueda dividirse exactamente en H cabezas. En producción sería preferible <code>ValueError</code>, porque los asserts pueden desactivarse.</p>
+    <pre><span class="line">18–20</span> self.d_model = …
+self.n_kv_heads = n_kv_heads if n_kv_heads else n_heads</pre><p>Guarda configuración. Si no se pide GQA, hay tantas cabezas K/V como Q. El uso de “truthiness” también convierte <code>0</code> en H antes de poder rechazarlo explícitamente.</p>
+    <pre><span class="line">21</span> self.n_rep = n_heads // self.n_kv_heads</pre><p>Número de veces que habrá que repetir cada cabeza K/V para alinearla con las H queries.</p>
+    <pre><span class="line">22</span> self.d_k = d_model // n_heads</pre><p>Calcula d, la anchura de cada cabeza.</p>
+    <pre><span class="line">23–27</span> self.dropout = … self.use_xsa = use_xsa</pre><p>Conserva las opciones para decidir el camino durante <code>forward</code>.</p>
+    <pre><span class="line">30</span> self.W_q = nn.Linear(D, D, bias=False)</pre><p>Crea Wq con forma matemática D×D. Aplicada a <code>[B,T,D]</code>, produce <code>[B,T,D]</code>.</p>
+    <pre><span class="line">31</span> assert H % Hkv == 0</pre><p>Garantiza grupos enteros: no puede repartirse, por ejemplo, 3 cabezas K/V entre 8 queries.</p>
+    <pre><span class="line">33–34</span> W_k/W_v = Linear(D, Hkv·d)</pre><p>En MHA normal, <code>Hkv·d=D</code>. En GQA es menor: con D=512, H=8 y Hkv=2, K y V salen con anchura 128.</p>
+    <pre><span class="line">37</span> self.W_o = nn.Linear(D, D, bias=False)</pre><p>Mezcla las H cabezas concatenadas y devuelve una representación en el espacio del modelo.</p>
+    <pre><span class="line">40</span> RoPECache(self.d_k, max_seq_len)</pre><p>Precalcula los senos/cosenos necesarios para posiciones hasta la longitud máxima.</p>
+    <pre><span class="line">43</span> Dropout(dropout) if dropout &gt; 0 else None</pre><p>Crea dropout solo para el camino manual; el camino fused recibe la probabilidad directamente.</p>
+    <pre><span class="line">46–47</span> qk_scale = Parameter(ones(H) · √d)</pre><p>Cada cabeza Q obtiene una escala entrenable. Como Q se normaliza a norma 1, inicializar con √d recupera una magnitud parecida a la atención convencional.</p>
+  </div>
+
+  <h2>2. Forward de MHA · líneas 49–131</h2>
+  <div class="walk">
+    <pre><span class="line">49–57</span> def forward(x, mask=None) …</pre><p>Contrato: entra y sale <code>[B,T,D]</code>. Aunque acepta <code>mask</code>, la implementación nunca lo utiliza.</p>
+    <pre><span class="line">58</span> batch_size, seq_len, d_model = x.shape</pre><p>Desempaqueta B, T y D del tensor real. No comprueba que el último D coincida con <code>self.d_model</code>; <code>Linear</code> fallará si no coincide.</p>
+    <pre><span class="line">61</span> q = W_q(x)</pre><p>Construye una query por token: qué busca ese token. Forma <code>[B,T,D]</code>.</p>
+    <pre><span class="line">62–63</span> k = W_k(x); v = W_v(x)</pre><p>K describe con qué puede coincidir cada token; V es la información que se agregará. En GQA la forma real es <code>[B,T,Hkv·d]</code>, así que el comentario <code>d_model</code> es incorrecto.</p>
+    <pre><span class="line">66</span> q.view(B,T,H,d)</pre><p>Separa la última dimensión D en H cabezas, sin copiar datos.</p>
+    <pre><span class="line">67–68</span> k/v.view(B,T,Hkv,d)</pre><p>Separa K y V en menos cabezas cuando hay GQA.</p>
+    <pre><span class="line">71–73</span> normalize(q/k, dim=-1)</pre><p>Divide cada vector por su norma L2. Q se multiplica por una escala entrenable por cabeza; K queda unitario. El producto Q·K pasa a comportarse como una similitud coseno escalada.</p>
+    <pre><span class="line">76</span> freqs = rope_cache.get_freqs(T)</pre><p>Toma solo las frecuencias de las T posiciones actuales.</p>
+    <pre><span class="line">77–78</span> apply_rope(q/k, freqs)</pre><p>Rota pares de coordenadas de Q y K según la posición. V no se rota: la posición altera las compatibilidades, no el contenido agregado.</p>
+    <pre><span class="line">81–83</span> repeat_interleave(n_rep, dim=2)</pre><p>Expande Hkv hasta H. Con H=8 y Hkv=2: <code>[k0,k1] → [k0,k0,k0,k0,k1,k1,k1,k1]</code>. Es una vista lógica deseable, aunque aquí se materializan repeticiones.</p>
+    <pre><span class="line">86–88</span> transpose(1, 2)</pre><p>Convierte <code>[B,T,H,d]</code> en <code>[B,H,T,d]</code>, el formato esperado por la operación de atención.</p>
+    <pre><span class="line">91–98</span> scaled_dot_product_attention(...)</pre><p>Camino optimizado. <code>is_causal=True</code> impide mirar posiciones futuras. Dropout solo actúa durante training. Con QK-Norm se fuerza escala 1; sin él, <code>None</code> deja que PyTorch use 1/√d.</p>
+    <pre><span class="line">94</span> attn_mask=None</pre><p>Confirma que el parámetro <code>mask</code> del método se ignora. No soporta padding masks ni una máscara personalizada.</p>
+    <pre><span class="line">101</span> scale = 1 or d**-0.5</pre><p>Replica manualmente la decisión de escala del camino fused.</p>
+    <pre><span class="line">102</span> scores = q @ k.transpose(-2,-1)</pre><p><code>[B,H,T,d] @ [B,H,d,T] → [B,H,T,T]</code>. Cada celda (i,j) mide cuánto atiende el token i al token j.</p>
+    <pre><span class="line">104–106</span> triu(full((T,T), -inf), diagonal=1)</pre><p>Crea −∞ por encima de la diagonal: son las posiciones futuras j&gt;i. Diagonal y pasado quedan en 0.</p>
+    <pre><span class="line">107</span> scores + causal_mask</pre><p>Broadcasting aplica la misma matriz <code>[T,T]</code> a todos los batches y cabezas.</p>
+    <pre><span class="line">108</span> softmax(scores, dim=-1)</pre><p>Convierte cada fila en pesos que suman 1. <code>softmax(-∞)=0</code>, por lo que el futuro recibe peso cero.</p>
+    <pre><span class="line">109–110</span> attn_dropout(weights)</pre><p>Regulariza conexiones de atención durante entrenamiento; no se aplica si dropout es 0.</p>
+    <pre><span class="line">111</span> weights @ v</pre><p><code>[B,H,T,T] @ [B,H,T,d] → [B,H,T,d]</code>: para cada query, suma valores del pasado ponderados.</p>
+    <pre><span class="line">117–122</span> if use_xsa: … output -= projection</pre><p>Calcula la proyección del vector de salida en el V de la misma posición y la resta. Resultado: la salida queda ortogonal a <code>vᵢ</code> (salvo tolerancia).</p>
+    <pre><span class="line">119</span> dot = (output * v).sum(...)</pre><p>Producto escalar ⟨oᵢ,vᵢ⟩ por batch, cabeza y posición.</p>
+    <pre><span class="line">120</span> denom = ||v||².clamp_min(1e-6)</pre><p>Denominador de la proyección; el clamp evita dividir por cero.</p>
+    <pre><span class="line">121–122</span> projection=(dot/denom)v; output-=projection</pre><p>Aplica <code>o⊥ = o − (⟨o,v⟩/||v||²)v</code>.</p>
+    <pre><span class="line">125</span> transpose(1,2)</pre><p>Vuelve de <code>[B,H,T,d]</code> a <code>[B,T,H,d]</code>.</p>
+    <pre><span class="line">126</span> contiguous().view(B,T,D)</pre><p><code>transpose</code> cambia strides; <code>contiguous</code> reorganiza memoria antes de fusionar H·d en D.</p>
+    <pre><span class="line">129–131</span> output=W_o(...); return output</pre><p>Mezcla información entre cabezas y devuelve <code>[B,T,D]</code>.</p>
+  </div>
+  <div class="callout warn"><strong>Matiz XSA.</strong> Esto no elimina literalmente el peso de
+  autoatención de la diagonal. Ortogonaliza toda la suma agregada respecto a <code>vᵢ</code>;
+  también puede eliminar componentes aportados por otros tokens que estén alineadas con
+  <code>vᵢ</code>. El nombre XSA necesita una fuente o una definición más precisa.</div>
+
+  <h2>3. DifferentialAttention · líneas 134–263</h2>
+  <p>La idea de la fuente primaria es restar dos mapas softmax para cancelar atención común o
+  “ruido”: <code>(A₁ − λA₂)V</code>. Este código obtiene los dos productos <code>A₁V</code> y
+  <code>A₂V</code> por separado y luego los resta; distributivamente es equivalente.</p>
+  <div class="walk">
+    <pre><span class="line">134–140</span> class DifferentialAttention …</pre><p>Segundo módulo de atención, ahora con dos pares Q/K y un V compartido.</p>
+    <pre><span class="line">142–150</span> __init__; divisibilidad H/Hkv</pre><p>Repite el contrato de MHA y prepara GQA.</p>
+    <pre><span class="line">152–155</span> d=D/H; assert d%4==0; d_half=d//2</pre><p>Cada cabeza se parte en dos. Cada mitad debe admitir RoPE, que opera por pares; por eso d necesita ser múltiplo de 4.</p>
+    <pre><span class="line">159–163</span> Wq, Wk, Wv, Wo</pre><p>Mismas proyecciones que antes. Q conserva D; K/V pueden reducir parámetros mediante Hkv.</p>
+    <pre><span class="line">166</span> λ_init = .8 − .6 exp(−.3 layer_idx)</pre><p>Schedule fijo por profundidad: vale 0.2 en la capa 0 y se aproxima a 0.8 en capas profundas.</p>
+    <pre><span class="line">167</span> register_buffer("lambda_init", tensor(...))</pre><p>Lo incluye en <code>state_dict</code> y lo mueve con el módulo entre CPU/GPU, pero no recibe gradiente.</p>
+    <pre><span class="line">168–171</span> lambda_q1/k1/q2/k2 = Parameter(...)</pre><p>Cuatro vectores entrenables. Su interacción produce la parte aprendida de λ.</p>
+    <pre><span class="line">173</span> head_norm = RMSNorm(d)</pre><p>Normaliza cada salida por cabeza sobre su última dimensión d.</p>
+    <pre><span class="line">174</span> RoPECache(d_half, max_seq_len)</pre><p>La caché usa la anchura de cada mitad, porque Q1/K1 y Q2/K2 se rotan por separado.</p>
+    <pre><span class="line">176–179</span> qk_scale1/qk_scale2</pre><p>Escalas independientes por cabeza para las dos ramas; ahora parten de √(d/2).</p>
+    <pre><span class="line">181–192</span> compute_lambda()</pre><p>Devuelve un escalar: <code>exp(λq1·λk1) − exp(λq2·λk2) + λinit</code>. Los exponentes hacen positivas las dos contribuciones antes de restarlas.</p>
+    <pre><span class="line">194–205</span> forward; proyectar; view</pre><p>Exactamente el mismo recorrido inicial que MHA. Los comentarios de K/V vuelven a ser incorrectos bajo GQA: su última dimensión es Hkv·d, no D.</p>
+    <pre><span class="line">209–210</span> q.chunk(2,-1); k.chunk(2,-1)</pre><p>Divide cada cabeza en Q1/Q2 y K1/K2, cada uno con anchura d/2. V no se divide.</p>
+    <pre><span class="line">213–217</span> QK-Norm por rama</pre><p>Normaliza cada mitad independientemente; cada rama aprende su propia escala Q.</p>
+    <pre><span class="line">220–224</span> RoPE en q1,q2,k1,k2</pre><p>Codifica posición en ambos patrones de atención.</p>
+    <pre><span class="line">227–230</span> repetir K1,K2,V</pre><p>Expande GQA hasta H. V mantiene anchura d, por eso cada resultado de atención vuelve a tener anchura d.</p>
+    <pre><span class="line">233–235</span> transpose</pre><p>Deja Q/K en <code>[B,H,T,d/2]</code> y V en <code>[B,H,T,d]</code>. SDPA permite que la dimensión de V difiera de la de Q/K.</p>
+    <pre><span class="line">238</span> lam = compute_lambda().to(v.dtype)</pre><p>Convierte λ al dtype de activaciones, importante con bf16/fp16.</p>
+    <pre><span class="line">241–255</span> attn1_output; attn2_output</pre><p>Ejecuta dos atenciones causales con V compartido. Cada resultado tiene <code>[B,H,T,d]</code>. La escala es 1 con QK-Norm y 1/√(d/2) sin él.</p>
+    <pre><span class="line">257</span> output = output1 − λ output2</pre><p>Equivale a <code>(A1−λA2)V</code> sin almacenar explícitamente los mapas <code>[T,T]</code>.</p>
+    <pre><span class="line">258–259</span> transpose; head_norm</pre><p>Pasa a <code>[B,T,H,d]</code> y aplica RMSNorm independientemente por token y cabeza.</p>
+    <pre><span class="line">260–261</span> output *= 1 − lambda_init</pre><p>Reescala usando el valor fijo por capa. No usa el λ aprendido aquí.</p>
+    <pre><span class="line">262–263</span> view(B,T,D); W_o; return</pre><p>Concatena cabezas, mezcla con Wo y conserva el contrato <code>[B,T,D]</code>.</p>
+  </div>
+
+  <h2>4. Tests · líneas 266–627</h2>
+  <p>Las líneas separadoras y los <code>print</code> solo organizan la salida. Estas son las líneas
+  ejecutables y qué demuestran —o qué no demuestran—.</p>
+  <div class="walk">
+    <pre><span class="line">268–292</span> assert_no_future_leak(...)</pre><p>Pone el módulo en evaluación, crea dos entradas idénticas, cambia solo el último token y exige que todas las salidas anteriores coincidan. Es una prueba conductual excelente de causalidad.</p>
+    <pre><span class="line">274</span> module.eval()</pre><p>Desactiva dropout. Sin esto, dos forwards diferirían por azar y producirían un falso positivo.</p>
+    <pre><span class="line">276</span> torch.no_grad()</pre><p>No construye grafo de gradientes: reduce memoria y deja claro que es una comprobación de inferencia.</p>
+    <pre><span class="line">277–282</span> x1; clone; cambiar x2[:,-1,:]</pre><p>Diseño contrafactual: solo cambia “el futuro” respecto a posiciones anteriores.</p>
+    <pre><span class="line">284–290</span> dos forwards; max_diff; allclose</pre><p>Compara posiciones <code>:-1</code>. <code>max_diff</code> solo mejora el diagnóstico; <code>allclose</code> decide el resultado.</p>
+    <pre><span class="line">294–322</span> test_attention, caso MHA</pre><p>Fija B/T/D/H, instancia MHA, crea entrada aleatoria y comprueba forma y ausencia de NaN.</p>
+    <pre><span class="line">327–342</span> caso GQA</pre><p>Reduce Hkv a 2 y verifica que la interfaz exterior sigue produciendo <code>[B,T,D]</code>.</p>
+    <pre><span class="line">347–355</span> longitudes 5,20,50</pre><p>Comprueba que T es dinámica dentro del límite de la caché. <code>eval</code> y <code>no_grad</code> hacen el test determinista y barato.</p>
+    <pre><span class="line">360–373</span> contar parámetros MHA</pre><p>Suma todos los parámetros y espera <code>4D²+H</code>: cuatro matrices D×D más las H escalas QK-Norm.</p>
+    <pre><span class="line">378–392</span> contar parámetros GQA</pre><p>Espera <code>2D² + 2D(Hkv·d) + H</code>. Demuestra la reducción de parámetros de K/V.</p>
+    <pre><span class="line">397–401</span> causalidad MHA/GQA</pre><p>Reutiliza la prueba contrafactual en ambas configuraciones.</p>
+    <pre><span class="line">406–418</span> camino manual</pre><p>Solo comprueba que ejecuta, mantiene forma y no genera NaN. No compara numéricamente el camino manual con SDPA.</p>
+    <pre><span class="line">423–472</span> DifferentialAttention normal/GQA</pre><p>Repite los smoke tests de forma y finitud para ambas configuraciones.</p>
+    <pre><span class="line">477–490</span> gradient flow</pre><p>Activa training, marca la entrada con <code>requires_grad</code>, reduce la salida a un escalar y llama <code>backward</code>. Exige gradiente finito en entrada y todos los parámetros entrenables.</p>
+    <pre><span class="line">497–519</span> schedule λ_init</pre><p>Instancia capa 0 y 23 y comprueba aproximadamente 0.2 y 0.8. Verifica la fórmula fija, no el aprendizaje de λ.</p>
+    <pre><span class="line">524–530</span> λ escalar y finito</pre><p><code>ndim==0</code> distingue un tensor escalar; <code>isfinite</code> rechaza NaN e infinitos.</p>
+    <pre><span class="line">535–559</span> causalidad y T dinámica</pre><p>Aplica las mismas invariantes a DifferentialAttention y su variante GQA.</p>
+    <pre><span class="line">561–579</span> XSA normal</pre><p>Smoke test: forma correcta y sin NaN.</p>
+    <pre><span class="line">581–590</span> XSA + GQA</pre><p>Ejercita el punto crítico: V debe haberse repetido hasta H antes de la proyección XSA.</p>
+    <pre><span class="line">593–598</span> gradiente XSA</pre><p>Solo verifica gradiente de entrada. A diferencia del test diferencial, no revisa cada parámetro.</p>
+    <pre><span class="line">600–605</span> causalidad XSA</pre><p>Confirma que la resta local por posición no introduce dependencias futuras.</p>
+    <pre><span class="line">608–613</span> attn_plain; load_state_dict</pre><p>Crea un control sin XSA y copia exactamente los mismos pesos. Así la única diferencia funcional es el flag XSA.</p>
+    <pre><span class="line">614</span> attn_xsa.eval(); attn_plain.eval()</pre><p>Dos sentencias en una línea; válidas, aunque menos legibles. Desactivan dropout.</p>
+    <pre><span class="line">615–618</span> max difference &gt; 1e-4</pre><p>Demuestra que XSA no es un no-op. No demuestra que su transformación sea conceptualmente correcta.</p>
+    <pre><span class="line">624–627</span> if __name__ == "__main__": …</pre><p>Ejecuta los tres grupos solo al lanzar el archivo como script. Al importarlo, define clases y funciones sin correr tests.</p>
+  </div>
+
+  <h2>5. Cinco observaciones que no debes perder</h2>
+  <ol>
+    <li><strong>Los comentarios de forma de K/V son erróneos con GQA</strong> en las líneas 62–63 y 199–200.</li>
+    <li><strong><code>mask</code> está muerto</strong>: aparece en ambas firmas, pero nunca participa en el cálculo.</li>
+    <li><strong>“Flash attention” no está garantizado</strong>: SDPA selecciona el backend disponible según dispositivo, dtype y formas.</li>
+    <li><strong>XSA no borra simplemente la diagonal</strong>; hace una ortogonalización geométrica posterior.</li>
+    <li><strong>Los tests son buenos smoke tests</strong>, pero faltan equivalencia manual/SDPA, límites de <code>max_seq_len</code>, máscaras personalizadas, entradas inválidas y una comprobación algebraica de XSA.</li>
+  </ol>
+
+  <h2>6. Recuperación activa</h2>
+  <details><summary>¿Por qué Q tiene H cabezas pero K/V pueden tener Hkv?</summary><p>Porque GQA permite compartir cada K/V entre varias queries, reduciendo parámetros y memoria sin cambiar la anchura externa D.</p></details>
+  <details><summary>¿Por qué se usa <code>contiguous()</code> después de <code>transpose</code>?</summary><p>Porque el tensor transpuesto suele tener strides no contiguos; antes de reinterpretar H·d como D se materializa un orden de memoria compatible.</p></details>
+  <details><summary>¿Qué forma tiene la matriz de scores?</summary><p><code>[B,H,T,T]</code>: por cada batch y cabeza, cada posición query puntúa todas las posiciones key.</p></details>
+  <details><summary>¿Por qué RoPE se aplica a Q/K y no a V?</summary><p>Porque modifica la compatibilidad posicional usada para elegir información; V contiene la información que se agrega.</p></details>
+
+  <h2>Fuentes primarias</h2>
+  <ul>
+    <li><a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html">PyTorch SDPA</a></li>
+    <li><a href="https://arxiv.org/abs/2104.09864">RoFormer / RoPE</a></li>
+    <li><a href="https://arxiv.org/abs/2410.05258">Differential Transformer</a></li>
+  </ul>
+  <p class="lede">Si una línea sigue sin estar clara, pregúntame por esa línea y la ejecutaremos con un ejemplo tensorial pequeño.</p>
+</main>
+</body>
+</html>
