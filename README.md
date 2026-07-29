@@ -158,7 +158,9 @@ uv run train-v1 \
 ```
 
 La receta propuesta para el run completo, junto con los gates local, A100 y H100 SXM, está en
-[V1 English 12B training run](docs/training/v1-english-12b.md).
+[V1 English 12B training run](docs/training/v1-english-12b.md). La ejecución reproducible en
+RunPod está detallada en [Running the V1 recipe on RunPod](docs/training/runpod-v1.md) y
+automatizada con `make help`.
 
 ## Desarrollo
 
