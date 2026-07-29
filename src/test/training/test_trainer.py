@@ -41,6 +41,29 @@ def test_training_config_rejects_an_unknown_precision() -> None:
         TrainingConfig(max_steps=1, precision="fp16")  # type: ignore[arg-type]
 
 
+def test_training_config_accepts_a_complete_wsd_schedule() -> None:
+    config = TrainingConfig(
+        max_steps=10,
+        warmup_steps=2,
+        max_learning_rate=1e-3,
+        min_learning_rate=0.0,
+        learning_rate_schedule="wsd",
+        decay_start_step=8,
+    )
+
+    assert config.learning_rate_schedule == "wsd"
+    assert config.decay_start_step == 8
+
+
+def test_training_config_requires_a_decay_boundary_for_wsd() -> None:
+    with pytest.raises(ValueError, match="decay_start_step is required"):
+        TrainingConfig(
+            max_steps=10,
+            learning_rate_schedule="wsd",
+            min_learning_rate=0.0,
+        )
+
+
 def test_train_step_runs_the_forward_pass_under_bf16_autocast() -> None:
     model = AutocastRecordingGPT()
     optimizer = torch.optim.AdamW(model.parameters())
@@ -391,6 +414,128 @@ def test_train_runs_accumulated_steps_with_scheduling_and_evaluation() -> None:
     assert all(metrics.step_time_seconds > 0.0 for metrics in history)
     assert all(metrics.tokens_per_second > 0.0 for metrics in history)
     assert not torch.equal(model.token_embedding.weight, embedding_before)
+
+
+def test_train_can_resume_from_an_already_positioned_batch_source() -> None:
+    torch.manual_seed(42)
+    model = _tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    input_ids = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5],
+            [1, 2, 3, 4, 5, 6],
+            [2, 3, 4, 5, 6, 7],
+            [3, 4, 5, 6, 7, 0],
+        ]
+    )
+    targets = torch.roll(input_ids, shifts=-1, dims=1)
+    positioned_loader = DataLoader(
+        TensorDataset(input_ids[2:], targets[2:]),
+        batch_size=1,
+        shuffle=False,
+    )
+    config = TrainingConfig(max_steps=4, grad_accum_steps=1)
+
+    history = train(
+        model=model,
+        optimizer=optimizer,
+        train_batches=positioned_loader,
+        config=config,
+        device="cpu",
+        start_step=2,
+        batches_start_step=2,
+        tokens_seen_at_start=12,
+    )
+
+    assert [metrics.step for metrics in history] == [3, 4]
+    assert [metrics.tokens_seen for metrics in history] == [18, 24]
+
+
+def test_positioned_resume_preserves_model_rng_when_rebuilding_the_loader_iterator() -> None:
+    torch.manual_seed(42)
+    uninterrupted_model = _tiny_model(dropout=0.2)
+    resumed_model = _tiny_model(dropout=0.2)
+    resumed_model.load_state_dict(uninterrupted_model.state_dict())
+    uninterrupted_optimizer = torch.optim.AdamW(
+        uninterrupted_model.parameters(),
+        lr=1e-2,
+        weight_decay=0.0,
+    )
+    resumed_optimizer = torch.optim.AdamW(
+        resumed_model.parameters(),
+        lr=1e-2,
+        weight_decay=0.0,
+    )
+    input_ids = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5],
+            [1, 2, 3, 4, 5, 6],
+            [2, 3, 4, 5, 6, 7],
+            [3, 4, 5, 6, 7, 0],
+        ]
+    )
+    targets = torch.roll(input_ids, shifts=-1, dims=1)
+    full_loader = DataLoader(
+        TensorDataset(input_ids, targets),
+        batch_size=1,
+        shuffle=False,
+    )
+    positioned_loader = DataLoader(
+        TensorDataset(input_ids[2:], targets[2:]),
+        batch_size=1,
+        shuffle=False,
+    )
+    config = TrainingConfig(
+        max_steps=4,
+        grad_accum_steps=1,
+        warmup_steps=1,
+        max_learning_rate=1e-2,
+        min_learning_rate=1e-3,
+    )
+    initial_training_rng_state = torch.random.get_rng_state()
+
+    train(
+        model=uninterrupted_model,
+        optimizer=uninterrupted_optimizer,
+        train_batches=full_loader,
+        config=config,
+        device="cpu",
+    )
+    torch.random.set_rng_state(initial_training_rng_state)
+    first_segment = train(
+        model=resumed_model,
+        optimizer=resumed_optimizer,
+        train_batches=full_loader,
+        config=config,
+        device="cpu",
+        end_step=2,
+    )
+    checkpoint_rng_state = torch.random.get_rng_state()
+    torch.rand(10)
+    torch.random.set_rng_state(checkpoint_rng_state)
+    second_segment = train(
+        model=resumed_model,
+        optimizer=resumed_optimizer,
+        train_batches=positioned_loader,
+        config=config,
+        device="cpu",
+        start_step=2,
+        batches_start_step=2,
+        tokens_seen_at_start=first_segment[-1].tokens_seen,
+    )
+
+    assert [metrics.step for metrics in second_segment] == [3, 4]
+    for uninterrupted_parameter, resumed_parameter in zip(
+        uninterrupted_model.parameters(),
+        resumed_model.parameters(),
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            resumed_parameter,
+            uninterrupted_parameter,
+            rtol=0.0,
+            atol=0.0,
+        )
 
 
 @pytest.mark.parametrize(

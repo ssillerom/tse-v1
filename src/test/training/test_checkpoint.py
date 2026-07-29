@@ -126,6 +126,8 @@ def test_checkpoint_restores_the_wandb_run_identity(tmp_path: Path) -> None:
         wandb_run_id="wandb-run-123",
         wandb_project="llm-from-scratch",
         wandb_entity="research-team",
+        data_position=64,
+        tokens_seen=384,
     )
 
     restored = restore_checkpoint(
@@ -140,6 +142,8 @@ def test_checkpoint_restores_the_wandb_run_identity(tmp_path: Path) -> None:
     assert restored.wandb_run_id == "wandb-run-123"
     assert restored.wandb_project == "llm-from-scratch"
     assert restored.wandb_entity == "research-team"
+    assert restored.data_position == 64
+    assert restored.tokens_seen == 384
 
 
 def test_checkpoint_retention_keeps_only_the_newest_files(tmp_path: Path) -> None:
@@ -266,7 +270,8 @@ def test_checkpoint_validates_the_training_run_configuration(tmp_path: Path) -> 
     optimizer = torch.optim.AdamW(model.parameters())
     training_config = TrainingConfig(max_steps=1)
     saved_run_config = TrainingRunConfig(
-        manifest_sha256="a" * 64,
+        data_contract_sha256="a" * 64,
+        seed=42,
         batch_size=2,
         optimizer_name="AdamW",
         optimizer_betas=(0.9, 0.95),
@@ -282,7 +287,27 @@ def test_checkpoint_validates_the_training_run_configuration(tmp_path: Path) -> 
         run_config=saved_run_config,
     )
     different_run_config = TrainingRunConfig(
-        manifest_sha256="a" * 64,
+        data_contract_sha256="a" * 64,
+        seed=43,
+        batch_size=2,
+        optimizer_name="AdamW",
+        optimizer_betas=(0.9, 0.95),
+        optimizer_weight_decay=0.1,
+        optimizer_eps=1e-8,
+    )
+
+    with pytest.raises(ValueError, match="checkpoint run_config does not match"):
+        restore_checkpoint(
+            path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            training_config=training_config,
+            run_config=different_run_config,
+        )
+
+    different_run_config = TrainingRunConfig(
+        data_contract_sha256="a" * 64,
+        seed=42,
         batch_size=4,
         optimizer_name="AdamW",
         optimizer_betas=(0.9, 0.95),
@@ -347,7 +372,8 @@ def test_checkpoint_v1_without_run_config_loads_with_an_explicit_warning(
     payload.pop("run_config")
     torch.save(payload, checkpoint_path)
     run_config = TrainingRunConfig(
-        manifest_sha256="a" * 64,
+        data_contract_sha256="a" * 64,
+        seed=42,
         batch_size=2,
         optimizer_name="AdamW",
         optimizer_betas=(0.9, 0.95),
@@ -355,7 +381,7 @@ def test_checkpoint_v1_without_run_config_loads_with_an_explicit_warning(
         optimizer_eps=1e-8,
     )
 
-    with pytest.warns(RuntimeWarning, match="cannot validate manifest, batch, or optimizer"):
+    with pytest.warns(RuntimeWarning, match="cannot validate data, seed, batch"):
         restored = restore_checkpoint(
             path=checkpoint_path,
             model=model,
@@ -370,7 +396,8 @@ def test_checkpoint_v1_without_run_config_loads_with_an_explicit_warning(
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("manifest_sha256", "not-a-digest", "manifest_sha256"),
+        ("data_contract_sha256", "not-a-digest", "data_contract_sha256"),
+        ("seed", True, "seed"),
         ("batch_size", 0, "batch_size"),
         ("optimizer_name", "", "optimizer_name"),
         ("optimizer_betas", (0.9, 1.0), "optimizer_betas"),
@@ -384,7 +411,8 @@ def test_training_run_config_rejects_invalid_values(
     message: str,
 ) -> None:
     values: dict[str, object] = {
-        "manifest_sha256": "a" * 64,
+        "data_contract_sha256": "a" * 64,
+        "seed": 42,
         "batch_size": 2,
         "optimizer_name": "AdamW",
         "optimizer_betas": (0.9, 0.95),

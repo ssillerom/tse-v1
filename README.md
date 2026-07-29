@@ -21,11 +21,12 @@ El modelo V1 ya incluye embeddings, bloques Pre-Norm con MHA + RoPE, RMSNorm, Sw
 compartidos con el `lm_head` y causal cross-entropy. Un smoke test pequeño verifica formas,
 causalidad, gradientes y que el modelo puede sobreajustar un batch dependiente del contexto.
 
-El módulo de entrenamiento añade AdamW configurable por el llamador, acumulación de gradientes
-ponderada por tokens, gradient clipping, warmup lineal con cosine decay, evaluación periódica y
-checkpoints atómicos que restauran modelo, optimizador, configuración y estado aleatorio. El
-smoke test E2E recorre documentos locales, shards, dataset, entrenamiento, evaluación y
-reanudación sin depender de la red.
+El módulo de entrenamiento añade grupos AdamW con weight decay selectivo, acumulación de
+gradientes ponderada por tokens, gradient clipping, warmup lineal con cosine decay o WSD,
+evaluación periódica y checkpoints atómicos que restauran modelo, optimizador, configuración,
+estado aleatorio y posición exacta en los datos. Una receta versionada puede mezclar varias
+fuentes y fases con un sampler determinista. El smoke test E2E recorre documentos locales,
+shards, mezcla de datos, entrenamiento, evaluación y reanudación sin depender de la red.
 
 ## Instalación
 
@@ -133,8 +134,8 @@ ilegible o incompatible, avisa y retrocede al anterior. También se puede pasar 
 a `--resume`. El checkpoint restaura pesos, AdamW, step, configuración, RNG de CPU/CUDA/MPS y
 la identidad completa de W&B (entity, proyecto e identificador). Al reanudar exige que ese run
 ya exista, en vez de crear silenciosamente uno nuevo. Antes de continuar también valida el
-manifest, batch size y los hiperparámetros de AdamW que determinan la posición de datos y la
-siguiente actualización. La
+contrato de datos (manifest o receta), seed, batch size y los hiperparámetros de AdamW que
+determinan la posición de datos y la siguiente actualización. La
 evaluación y las muestras realizadas al abrir el run preservan el RNG restaurado. Como el
 learning-rate schedule es una función del step y de la configuración guardada, no necesita un
 objeto de scheduler separado.
@@ -154,6 +155,9 @@ uv run train-v1 \
   --manifest data/fineweb-edu-50/manifest.json \
   --wandb-mode disabled
 ```
+
+La receta propuesta para el run completo, junto con los gates local, A100 y H100 SXM, está en
+[V1 English 12B training run](docs/training/v1-english-12b.md).
 
 ## Desarrollo
 
@@ -182,8 +186,8 @@ documentos pequeños y escriben shards reales en directorios temporales.
 - Las secuencias no cruzan fronteras de shard; la cola incompleta de cada shard se descarta.
 - El entrenamiento actual es de un solo dispositivo; CUDA usa BF16 con
   `--precision auto` cuando el hardware lo soporta.
-- La reproducción exacta del orden de datos al reanudar requiere un iterable determinista que
-  pueda reiniciarse; todavía no se guarda el estado de samplers aleatorios o distribuidos.
+- El sampler multifuente incluido es determinista y reanudable, pero todavía no existe un
+  sampler distribuido para entrenamiento multi-GPU.
 - FineWeb-Edu sirve para validar el pipeline en inglés, no como corpus bilingüe final.
 
 Los datasets preparados, checkpoints y logs son artefactos locales y no deben añadirse a Git.

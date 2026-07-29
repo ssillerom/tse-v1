@@ -1,0 +1,60 @@
+{
+  "format_version": 1,
+  "name": "v1-english-12b",
+  "sources": [
+    {
+      "name": "fineweb_edu",
+      "manifest": "../data/pretrain-v1/fineweb-edu/manifest.json"
+    },
+    {
+      "name": "code",
+      "manifest": "../data/pretrain-v1/code/manifest.json"
+    },
+    {
+      "name": "finemath",
+      "manifest": "../data/pretrain-v1/finemath/manifest.json"
+    },
+    {
+      "name": "wikipedia",
+      "manifest": "../data/pretrain-v1/wikipedia-en/manifest.json"
+    },
+    {
+      "name": "fineweb_edu_premium",
+      "manifest": "../data/pretrain-v1/fineweb-edu-premium/manifest.json"
+    },
+    {
+      "name": "code_premium",
+      "manifest": "../data/pretrain-v1/code-premium/manifest.json"
+    },
+    {
+      "name": "finemath_premium",
+      "manifest": "../data/pretrain-v1/finemath-premium/manifest.json"
+    },
+    {
+      "name": "knowledge_premium",
+      "manifest": "../data/pretrain-v1/knowledge-premium/manifest.json"
+    }
+  ],
+  "phases": [
+    {
+      "name": "stable",
+      "tokens": 10800000000,
+      "source_tokens": {
+        "fineweb_edu": 9600000000,
+        "code": 600000512,
+        "finemath": 400000000,
+        "wikipedia": 199999488
+      }
+    },
+    {
+      "name": "decay",
+      "tokens": 1200000000,
+      "source_tokens": {
+        "fineweb_edu_premium": 899999744,
+        "code_premium": 150000640,
+        "finemath_premium": 99999744,
+        "knowledge_premium": 49999872
+      }
+    }
+  ]
+}

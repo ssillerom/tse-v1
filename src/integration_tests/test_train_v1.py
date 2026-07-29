@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,7 @@ from model.config import ModelConfig
 from model.gpt import GPT
 from scripts.train_v1 import main
 from training.checkpoint import TrainingRunConfig, save_checkpoint
+from training.optimizer import build_adamw_parameter_groups
 from training.trainer import TrainingConfig, train
 
 
@@ -46,6 +48,48 @@ def _write_training_manifest(directory: Path) -> Path:
         },
     )
     return manifest_path
+
+
+def _write_recipe(directory: Path) -> Path:
+    general_directory = directory / "general"
+    code_directory = directory / "code"
+    general_directory.mkdir()
+    code_directory.mkdir()
+    general_manifest = _write_training_manifest(general_directory)
+    code_manifest = _write_training_manifest(code_directory)
+    recipe_path = directory / "recipe.json"
+    recipe_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "name": "tiny-mixed-run",
+                "sources": [
+                    {
+                        "name": "fineweb_edu",
+                        "manifest": str(general_manifest.relative_to(directory)),
+                    },
+                    {
+                        "name": "stack_edu",
+                        "manifest": str(code_manifest.relative_to(directory)),
+                    },
+                ],
+                "phases": [
+                    {
+                        "name": "stable",
+                        "tokens": 24,
+                        "source_tokens": {"fineweb_edu": 16, "stack_edu": 8},
+                    },
+                    {
+                        "name": "decay",
+                        "tokens": 8,
+                        "source_tokens": {"fineweb_edu": 4, "stack_edu": 4},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return recipe_path
 
 
 def test_train_v1_runs_evaluation_generation_and_checkpointing_offline(
@@ -100,6 +144,104 @@ def test_train_v1_runs_evaluation_generation_and_checkpointing_offline(
     assert checkpoint["training_config"]["precision"] == "bf16"
 
 
+def test_train_v1_runs_a_complete_mixed_recipe_with_wsd(tmp_path: Path) -> None:
+    recipe_path = _write_recipe(tmp_path)
+    uninterrupted_dir = tmp_path / "uninterrupted"
+    resumed_dir = tmp_path / "resumed"
+    common_arguments = [
+        "--recipe",
+        str(recipe_path),
+        "--device",
+        "cpu",
+        "--precision",
+        "fp32",
+        "--d-model",
+        "8",
+        "--n-layers",
+        "1",
+        "--n-heads",
+        "2",
+        "--seq-len",
+        "4",
+        "--dropout",
+        "0.2",
+        "--batch-size",
+        "2",
+        "--grad-accum-steps",
+        "1",
+        "--warmup-steps",
+        "1",
+        "--lr-schedule",
+        "wsd",
+        "--eval-interval",
+        "2",
+        "--eval-batches",
+        "1",
+        "--sample-interval",
+        "4",
+        "--max-new-tokens",
+        "1",
+        "--checkpoint-interval",
+        "2",
+        "--wandb-mode",
+        "disabled",
+    ]
+
+    assert (
+        main(
+            common_arguments
+            + [
+                "--checkpoint-dir",
+                str(uninterrupted_dir),
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            common_arguments
+            + [
+                "--checkpoint-dir",
+                str(resumed_dir),
+                "--stop-after-step",
+                "2",
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            common_arguments
+            + [
+                "--checkpoint-dir",
+                str(resumed_dir),
+                "--resume",
+                "latest",
+            ]
+        )
+        == 0
+    )
+
+    checkpoint = torch.load(resumed_dir / "step_000004.pt", weights_only=True)
+    uninterrupted_checkpoint = torch.load(
+        uninterrupted_dir / "step_000004.pt",
+        weights_only=True,
+    )
+    assert checkpoint["step"] == 4
+    assert checkpoint["data_position"] == 8
+    assert checkpoint["tokens_seen"] == 32
+    assert checkpoint["training_config"]["learning_rate_schedule"] == "wsd"
+    assert checkpoint["training_config"]["decay_start_step"] == 3
+    assert checkpoint["training_config"]["min_learning_rate"] == 0.0
+    for name, expected_parameter in uninterrupted_checkpoint["model_state"].items():
+        torch.testing.assert_close(
+            checkpoint["model_state"][name],
+            expected_parameter,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+
 def test_train_v1_resumes_from_a_checkpoint_and_preserves_the_wandb_run(
     tmp_path: Path,
 ) -> None:
@@ -128,15 +270,15 @@ def test_train_v1_resumes_from_a_checkpoint_and_preserves_the_wandb_run(
     )
     model = GPT(model_config)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        build_adamw_parameter_groups(model, weight_decay=0.1),
         lr=training_config.max_learning_rate,
         betas=(0.9, 0.95),
-        weight_decay=0.1,
     )
     with manifest_path.open("rb") as manifest_file:
         manifest_sha256 = hashlib.file_digest(manifest_file, "sha256").hexdigest()
     run_config = TrainingRunConfig(
-        manifest_sha256=manifest_sha256,
+        data_contract_sha256=manifest_sha256,
+        seed=42,
         batch_size=2,
         optimizer_name="AdamW",
         optimizer_betas=(0.9, 0.95),
@@ -257,4 +399,11 @@ def test_train_v1_resumes_from_a_checkpoint_and_preserves_the_wandb_run(
     project_index = mismatched_arguments.index("--wandb-project") + 1
     mismatched_arguments[project_index] = "another-project"
     with pytest.raises(ValueError, match="wandb_project does not match"):
+        main(mismatched_arguments)
+
+    mismatched_arguments = list(command_arguments)
+    resume_index = mismatched_arguments.index("--resume") + 1
+    mismatched_arguments[resume_index] = str(checkpoint_dir / "step_000002.pt")
+    mismatched_arguments.extend(["--seed", "43"])
+    with pytest.raises(ValueError, match="checkpoint run_config does not match"):
         main(mismatched_arguments)

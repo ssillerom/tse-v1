@@ -14,10 +14,11 @@ from src.model.gpt import GPT, IGNORE_INDEX
 
 from .evaluation import perplexity_from_loss
 from .rng import capture_torch_rng_state, restore_torch_rng_state
-from .scheduler import get_learning_rate
+from .scheduler import get_learning_rate, get_wsd_learning_rate
 
 Batch = tuple[torch.Tensor, torch.Tensor]
 Precision = Literal["fp32", "bf16"]
+LearningRateSchedule = Literal["cosine", "wsd"]
 
 
 def _validate_max_grad_norm(max_grad_norm: object) -> None:
@@ -73,6 +74,8 @@ class TrainingConfig:
     eval_interval: int | None = None
     eval_batches: int | None = None
     precision: Precision = "fp32"
+    learning_rate_schedule: LearningRateSchedule = "cosine"
+    decay_start_step: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -102,14 +105,33 @@ class TrainingConfig:
             raise ValueError("eval_batches requires eval_interval")
         if self.precision not in ("fp32", "bf16"):
             raise ValueError(f"precision must be one of ('fp32', 'bf16'), got {self.precision!r}")
-
-        get_learning_rate(
-            step=0,
-            warmup_steps=self.warmup_steps,
-            max_steps=self.max_steps,
-            max_learning_rate=self.max_learning_rate,
-            min_learning_rate=self.min_learning_rate,
-        )
+        if self.learning_rate_schedule == "cosine":
+            if self.decay_start_step is not None:
+                raise ValueError("decay_start_step is supported only by the wsd schedule")
+            get_learning_rate(
+                step=0,
+                warmup_steps=self.warmup_steps,
+                max_steps=self.max_steps,
+                max_learning_rate=self.max_learning_rate,
+                min_learning_rate=self.min_learning_rate,
+            )
+        elif self.learning_rate_schedule == "wsd":
+            if self.decay_start_step is None:
+                raise ValueError("decay_start_step is required for the wsd schedule")
+            if self.min_learning_rate != 0.0:
+                raise ValueError("min_learning_rate must be 0.0 for the wsd schedule")
+            get_wsd_learning_rate(
+                step=0,
+                warmup_steps=self.warmup_steps,
+                decay_start_step=self.decay_start_step,
+                max_steps=self.max_steps,
+                max_learning_rate=self.max_learning_rate,
+            )
+        else:
+            raise ValueError(
+                "learning_rate_schedule must be one of ('cosine', 'wsd'), "
+                f"got {self.learning_rate_schedule!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -203,15 +225,15 @@ def _batch_iterator_at_step(
     batches: Iterable[Batch],
     completed_steps: int,
     grad_accum_steps: int,
+    batches_start_step: int,
+    tokens_seen_at_start: int,
 ) -> tuple[Iterator[Batch], int]:
-    if completed_steps == 0:
-        return iter(batches), 0
-
+    steps_to_replay = completed_steps - batches_start_step
     rng_snapshot = capture_torch_rng_state()
     try:
         batch_iterator = iter(batches)
-        tokens_seen = 0
-        for _ in range(completed_steps * grad_accum_steps):
+        tokens_seen = tokens_seen_at_start
+        for _ in range(steps_to_replay * grad_accum_steps):
             batch, batch_iterator = _next_batch(batches, batch_iterator)
             tokens_seen += int((batch[1] != IGNORE_INDEX).sum().item())
         return batch_iterator, tokens_seen
@@ -237,6 +259,8 @@ def train(
     start_step: int = 0,
     end_step: int | None = None,
     on_step: StepCallback | None = None,
+    batches_start_step: int = 0,
+    tokens_seen_at_start: int = 0,
 ) -> tuple[StepMetrics, ...]:
     """Train one deterministic segment and return metrics for completed steps.
 
@@ -251,6 +275,20 @@ def train(
         raise ValueError(
             f"start_step must be between 0 and max_steps={config.max_steps}, got {start_step!r}"
         )
+    if (
+        not isinstance(batches_start_step, int)
+        or isinstance(batches_start_step, bool)
+        or not 0 <= batches_start_step <= start_step
+    ):
+        raise ValueError(
+            f"batches_start_step must be between 0 and start_step, got {batches_start_step!r}"
+        )
+    if (
+        not isinstance(tokens_seen_at_start, int)
+        or isinstance(tokens_seen_at_start, bool)
+        or tokens_seen_at_start < 0
+    ):
+        raise ValueError("tokens_seen_at_start must be a non-negative integer")
     effective_end_step = config.max_steps if end_step is None else end_step
     if (
         not isinstance(effective_end_step, int)
@@ -276,6 +314,8 @@ def train(
         batches=train_batches,
         completed_steps=start_step,
         grad_accum_steps=config.grad_accum_steps,
+        batches_start_step=batches_start_step,
+        tokens_seen_at_start=tokens_seen_at_start,
     )
 
     for step_index in range(start_step, effective_end_step):
@@ -284,13 +324,24 @@ def train(
             batch, batch_iterator = _next_batch(train_batches, batch_iterator)
             microbatches.append(batch)
 
-        learning_rate = get_learning_rate(
-            step=step_index,
-            warmup_steps=config.warmup_steps,
-            max_steps=config.max_steps,
-            max_learning_rate=config.max_learning_rate,
-            min_learning_rate=config.min_learning_rate,
-        )
+        if config.learning_rate_schedule == "wsd":
+            if config.decay_start_step is None:
+                raise RuntimeError("validated WSD config has no decay_start_step")
+            learning_rate = get_wsd_learning_rate(
+                step=step_index,
+                warmup_steps=config.warmup_steps,
+                decay_start_step=config.decay_start_step,
+                max_steps=config.max_steps,
+                max_learning_rate=config.max_learning_rate,
+            )
+        else:
+            learning_rate = get_learning_rate(
+                step=step_index,
+                warmup_steps=config.warmup_steps,
+                max_steps=config.max_steps,
+                max_learning_rate=config.max_learning_rate,
+                min_learning_rate=config.min_learning_rate,
+            )
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = learning_rate
 

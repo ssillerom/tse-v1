@@ -12,7 +12,9 @@ import wandb
 from torch.utils.data import DataLoader
 
 from src.data.dataset import PretrainingDataset
-from src.data.manifest import load_manifest
+from src.data.manifest import ManifestTokenizer, load_manifest
+from src.data.mixture import DeterministicMixtureSampler, MixtureDataset
+from src.data.recipe import TrainingRecipe, load_training_recipe
 from src.model.config import ModelConfig
 from src.model.gpt import GPT
 from src.training.checkpoint import (
@@ -22,8 +24,16 @@ from src.training.checkpoint import (
     save_checkpoint,
 )
 from src.training.evaluation import perplexity_from_loss
+from src.training.optimizer import build_adamw_parameter_groups
 from src.training.rng import capture_torch_rng_state, restore_torch_rng_state
-from src.training.trainer import Precision, StepMetrics, TrainingConfig, evaluate, train
+from src.training.trainer import (
+    LearningRateSchedule,
+    Precision,
+    StepMetrics,
+    TrainingConfig,
+    evaluate,
+    train,
+)
 from src.training.wandb_logging import WandbEvaluationLogger, WandbRun
 
 WandbMode = Literal["online", "offline", "disabled"]
@@ -35,7 +45,9 @@ DEFAULT_WANDB_PROJECT = "llm-from-scratch"
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, required=True)
+    data_source = parser.add_mutually_exclusive_group(required=True)
+    data_source.add_argument("--manifest", type=Path)
+    data_source.add_argument("--recipe", type=Path)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/v1"))
     parser.add_argument(
         "--resume",
@@ -58,13 +70,38 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.0)
 
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--max-steps", type=int, default=500)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="optimizer-step limit; defaults to 500 for one manifest or the recipe budget",
+    )
+    parser.add_argument(
+        "--stop-after-step",
+        type=int,
+        help="finish this process early while keeping the full schedule resumable",
+    )
     parser.add_argument("--grad-accum-steps", type=int, default=4)
     parser.add_argument("--warmup-steps", type=int, default=25)
     parser.add_argument("--max-learning-rate", type=float, default=3e-4)
-    parser.add_argument("--min-learning-rate", type=float, default=3e-5)
+    parser.add_argument(
+        "--min-learning-rate",
+        type=float,
+        help="defaults to 3e-5 for cosine and 0 for WSD",
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("cosine", "wsd"),
+        default="cosine",
+    )
+    parser.add_argument(
+        "--decay-start-step",
+        type=int,
+        help="first WSD decay step; inferred from the final recipe phase when omitted",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--pin-memory", action="store_true")
 
     parser.add_argument("--eval-interval", type=int, default=50)
     parser.add_argument("--eval-batches", type=int, default=20)
@@ -108,17 +145,21 @@ def _resolve_precision(requested: PrecisionArgument, device: torch.device) -> Pr
     return requested
 
 
+def _load_encoding_from_tokenizer(tokenizer: ManifestTokenizer) -> tiktoken.Encoding:
+    encoding = tiktoken.get_encoding(tokenizer.encoding_name)
+    if encoding.eot_token != tokenizer.eot_token_id:
+        raise ValueError(
+            f"Tokenizer eot_token={tokenizer.eot_token_id} does not match "
+            f"encoding {tokenizer.encoding_name!r}"
+        )
+    return encoding
+
+
 def _load_encoding(manifest_path: Path) -> tiktoken.Encoding:
     tokenizer = load_manifest(manifest_path).tokenizer
     if tokenizer is None:
         raise ValueError("Manifest must declare tokenizer metadata for evaluation")
-    encoding = tiktoken.get_encoding(tokenizer.encoding_name)
-    if encoding.eot_token != tokenizer.eot_token_id:
-        raise ValueError(
-            f"Manifest eot_token={tokenizer.eot_token_id} does not match "
-            f"encoding {tokenizer.encoding_name!r}"
-        )
-    return encoding
+    return _load_encoding_from_tokenizer(tokenizer)
 
 
 def _manifest_sha256(manifest_path: Path) -> str:
@@ -126,11 +167,68 @@ def _manifest_sha256(manifest_path: Path) -> str:
         return hashlib.file_digest(manifest_file, "sha256").hexdigest()
 
 
+def _recipe_sha256(recipe: TrainingRecipe) -> str:
+    """Fingerprint the recipe contract and every referenced manifest."""
+    digest = hashlib.sha256()
+    digest.update(recipe.path.read_bytes())
+    for source in recipe.sources:
+        digest.update(b"\0")
+        digest.update(source.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(source.manifest_path.read_bytes())
+    return digest.hexdigest()
+
+
+def _resolve_recipe_steps(
+    recipe: TrainingRecipe,
+    seq_len: int,
+    batch_size: int,
+    grad_accum_steps: int,
+    requested_max_steps: int | None,
+) -> int:
+    tokens_per_step = seq_len * batch_size * grad_accum_steps
+    available_steps = recipe.total_tokens // tokens_per_step
+    if available_steps == 0:
+        raise ValueError(f"Recipe {recipe.name!r} does not contain one complete optimizer step")
+    if requested_max_steps is None:
+        return available_steps
+    if requested_max_steps > available_steps:
+        raise ValueError(
+            f"max_steps={requested_max_steps} exceeds the {available_steps} complete "
+            f"optimizer steps in recipe {recipe.name!r}"
+        )
+    return requested_max_steps
+
+
+def _resolve_decay_start_step(
+    schedule: LearningRateSchedule,
+    requested_decay_start_step: int | None,
+    recipe: TrainingRecipe | None,
+    max_steps: int,
+    seq_len: int,
+    batch_size: int,
+    grad_accum_steps: int,
+) -> int | None:
+    if schedule == "cosine":
+        return requested_decay_start_step
+    if requested_decay_start_step is not None:
+        return requested_decay_start_step
+    if recipe is None or len(recipe.phases) == 1:
+        return max_steps
+    stable_tokens = sum(phase.target_tokens for phase in recipe.phases[:-1])
+    tokens_per_step = seq_len * batch_size * grad_accum_steps
+    return min(stable_tokens // tokens_per_step, max_steps)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one finite V1 experiment."""
     arguments = _build_parser().parse_args(argv)
     if arguments.batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if arguments.grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be positive")
+    if arguments.num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
     if arguments.checkpoint_interval <= 0:
         raise ValueError("checkpoint_interval must be positive")
     if arguments.keep_last_checkpoints <= 0:
@@ -142,7 +240,12 @@ def main(argv: list[str] | None = None) -> int:
     if device.type == "mps":
         torch.mps.manual_seed(arguments.seed)
 
-    encoding = _load_encoding(arguments.manifest)
+    recipe = None if arguments.recipe is None else load_training_recipe(arguments.recipe)
+    encoding = (
+        _load_encoding(arguments.manifest)
+        if recipe is None
+        else _load_encoding_from_tokenizer(recipe.tokenizer)
+    )
     if arguments.vocab_size < encoding.n_vocab:
         raise ValueError(
             f"vocab_size={arguments.vocab_size} is smaller than tokenizer vocabulary "
@@ -158,55 +261,118 @@ def main(argv: list[str] | None = None) -> int:
         dropout=arguments.dropout,
         use_sdpa=True,
     )
+    max_steps = (
+        arguments.max_steps
+        if arguments.max_steps is not None
+        else 500
+        if recipe is None
+        else _resolve_recipe_steps(
+            recipe=recipe,
+            seq_len=model_config.max_seq_len,
+            batch_size=arguments.batch_size,
+            grad_accum_steps=arguments.grad_accum_steps,
+            requested_max_steps=None,
+        )
+    )
+    if recipe is not None and arguments.max_steps is not None:
+        max_steps = _resolve_recipe_steps(
+            recipe=recipe,
+            seq_len=model_config.max_seq_len,
+            batch_size=arguments.batch_size,
+            grad_accum_steps=arguments.grad_accum_steps,
+            requested_max_steps=arguments.max_steps,
+        )
+    schedule = cast(LearningRateSchedule, arguments.lr_schedule)
+    min_learning_rate = (
+        arguments.min_learning_rate
+        if arguments.min_learning_rate is not None
+        else 0.0
+        if schedule == "wsd"
+        else 3e-5
+    )
+    decay_start_step = _resolve_decay_start_step(
+        schedule=schedule,
+        requested_decay_start_step=arguments.decay_start_step,
+        recipe=recipe,
+        max_steps=max_steps,
+        seq_len=model_config.max_seq_len,
+        batch_size=arguments.batch_size,
+        grad_accum_steps=arguments.grad_accum_steps,
+    )
     training_config = TrainingConfig(
-        max_steps=arguments.max_steps,
+        max_steps=max_steps,
         grad_accum_steps=arguments.grad_accum_steps,
         warmup_steps=arguments.warmup_steps,
         max_learning_rate=arguments.max_learning_rate,
-        min_learning_rate=arguments.min_learning_rate,
+        min_learning_rate=min_learning_rate,
         max_grad_norm=arguments.max_grad_norm,
         eval_interval=arguments.eval_interval,
         eval_batches=arguments.eval_batches,
         precision=precision,
+        learning_rate_schedule=schedule,
+        decay_start_step=decay_start_step,
+    )
+    end_step = (
+        training_config.max_steps
+        if arguments.stop_after_step is None
+        else arguments.stop_after_step
+    )
+    if not 0 <= end_step <= training_config.max_steps:
+        raise ValueError(
+            "stop_after_step must be between 0 and "
+            f"max_steps={training_config.max_steps}, got {end_step}"
+        )
+    data_contract_sha256 = (
+        _manifest_sha256(arguments.manifest) if recipe is None else _recipe_sha256(recipe)
     )
     run_config = TrainingRunConfig(
-        manifest_sha256=_manifest_sha256(arguments.manifest),
+        data_contract_sha256=data_contract_sha256,
+        seed=arguments.seed,
         batch_size=arguments.batch_size,
         optimizer_name="AdamW",
         optimizer_betas=ADAMW_BETAS,
         optimizer_weight_decay=arguments.weight_decay,
         optimizer_eps=ADAMW_EPS,
     )
-    train_dataset = PretrainingDataset(
-        manifest_path=arguments.manifest,
-        split="train",
-        seq_len=model_config.max_seq_len,
-    )
+    if recipe is None:
+        train_dataset: PretrainingDataset | MixtureDataset = PretrainingDataset(
+            manifest_path=arguments.manifest,
+            split="train",
+            seq_len=model_config.max_seq_len,
+        )
+        validation_manifest_path = arguments.manifest
+    else:
+        train_dataset = MixtureDataset(
+            {
+                source.name: PretrainingDataset(
+                    manifest_path=source.manifest_path,
+                    split="train",
+                    seq_len=model_config.max_seq_len,
+                )
+                for source in recipe.sources
+            }
+        )
+        validation_manifest_path = recipe.sources[0].manifest_path
     validation_dataset = PretrainingDataset(
-        manifest_path=arguments.manifest,
+        manifest_path=validation_manifest_path,
         split="validation",
         seq_len=model_config.max_seq_len,
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=arguments.batch_size,
-        shuffle=False,
-        drop_last=True,
     )
     validation_loader = DataLoader(
         validation_dataset,
         batch_size=arguments.batch_size,
         shuffle=False,
         drop_last=False,
+        num_workers=arguments.num_workers,
+        pin_memory=arguments.pin_memory,
     )
 
     model = GPT(model_config).to(device)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        build_adamw_parameter_groups(model, weight_decay=arguments.weight_decay),
         lr=training_config.max_learning_rate,
         betas=run_config.optimizer_betas,
         eps=run_config.optimizer_eps,
-        weight_decay=arguments.weight_decay,
     )
     restored_checkpoint = None
     if arguments.resume is not None:
@@ -229,6 +395,45 @@ def main(argv: list[str] | None = None) -> int:
                 run_config=run_config,
             )
     start_step = 0 if restored_checkpoint is None else restored_checkpoint.step
+    sequences_per_step = arguments.batch_size * training_config.grad_accum_steps
+    expected_data_position = start_step * sequences_per_step
+    if recipe is not None:
+        restored_data_position = (
+            0 if restored_checkpoint is None else restored_checkpoint.data_position
+        )
+        if restored_data_position != expected_data_position:
+            raise ValueError(
+                "Recipe checkpoint data_position does not match its completed steps: "
+                f"expected {expected_data_position}, got {restored_data_position}"
+            )
+        sampler = DeterministicMixtureSampler(
+            dataset=cast(MixtureDataset, train_dataset),
+            phases=recipe.phases,
+            seq_len=model_config.max_seq_len,
+            seed=arguments.seed,
+            start_position=restored_data_position,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=arguments.batch_size,
+            sampler=sampler,
+            drop_last=True,
+            num_workers=arguments.num_workers,
+            pin_memory=arguments.pin_memory,
+        )
+        batches_start_step = start_step
+        tokens_seen_at_start = 0 if restored_checkpoint is None else restored_checkpoint.tokens_seen
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=arguments.batch_size,
+            shuffle=False,
+            drop_last=True,
+            num_workers=arguments.num_workers,
+            pin_memory=arguments.pin_memory,
+        )
+        batches_start_step = 0
+        tokens_seen_at_start = 0
     resume_rng_snapshot = None if restored_checkpoint is None else capture_torch_rng_state()
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     run_name = arguments.wandb_name or (
@@ -273,10 +478,31 @@ def main(argv: list[str] | None = None) -> int:
                 "eps": run_config.optimizer_eps,
                 "weight_decay": run_config.optimizer_weight_decay,
             },
-            "data": {
-                "manifest": str(arguments.manifest),
-                "batch_size": arguments.batch_size,
-            },
+            "data": (
+                {
+                    "manifest": str(arguments.manifest),
+                    "batch_size": arguments.batch_size,
+                }
+                if recipe is None
+                else {
+                    "recipe": str(recipe.path),
+                    "recipe_name": recipe.name,
+                    "recipe_tokens": recipe.total_tokens,
+                    "validation_source": recipe.sources[0].name,
+                    "sources": {
+                        source.name: str(source.manifest_path) for source in recipe.sources
+                    },
+                    "phases": [
+                        {
+                            "name": phase.name,
+                            "tokens": phase.target_tokens,
+                            "source_tokens": phase.source_token_map,
+                        }
+                        for phase in recipe.phases
+                    ],
+                    "batch_size": arguments.batch_size,
+                }
+            ),
             "seed": arguments.seed,
             "device": str(device),
             "parameter_count": parameter_count,
@@ -337,6 +563,8 @@ def main(argv: list[str] | None = None) -> int:
                     wandb_entity=checkpoint_wandb_entity,
                     keep_last_n=arguments.keep_last_checkpoints,
                     run_config=run_config,
+                    data_position=metrics.step * sequences_per_step,
+                    tokens_seen=metrics.tokens_seen,
                 )
             logger(metrics)
 
@@ -351,7 +579,10 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
             validation_batches=validation_loader,
             start_step=start_step,
+            end_step=end_step,
             on_step=on_step,
+            batches_start_step=batches_start_step,
+            tokens_seen_at_start=tokens_seen_at_start,
         )
         final_step = history[-1].step if history else start_step
         if final_step % arguments.checkpoint_interval != 0:
@@ -366,6 +597,8 @@ def main(argv: list[str] | None = None) -> int:
                 wandb_entity=checkpoint_wandb_entity,
                 keep_last_n=arguments.keep_last_checkpoints,
                 run_config=run_config,
+                data_position=final_step * sequences_per_step,
+                tokens_seen=(history[-1].tokens_seen if history else tokens_seen_at_start),
             )
 
     return 0

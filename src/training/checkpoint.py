@@ -16,8 +16,8 @@ from src.model.gpt import GPT
 from .rng import TorchRngSnapshot, capture_torch_rng_state, restore_torch_rng_state
 from .trainer import TrainingConfig
 
-CHECKPOINT_FORMAT_VERSION = 3
-SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = frozenset({1, 2, CHECKPOINT_FORMAT_VERSION})
+CHECKPOINT_FORMAT_VERSION = 4
+SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = frozenset({1, 2, 3, CHECKPOINT_FORMAT_VERSION})
 CHECKPOINT_FILENAME_PATTERN = re.compile(r"step_(\d+)\.pt\Z")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -31,13 +31,16 @@ class RestoredCheckpoint:
     wandb_run_id: str | None
     wandb_project: str | None
     wandb_entity: str | None
+    data_position: int
+    tokens_seen: int
 
 
 @dataclass(frozen=True)
 class TrainingRunConfig:
     """Settings outside TrainingConfig that determine exact continuation."""
 
-    manifest_sha256: str
+    data_contract_sha256: str
+    seed: int
     batch_size: int
     optimizer_name: str
     optimizer_betas: tuple[float, float]
@@ -45,10 +48,12 @@ class TrainingRunConfig:
     optimizer_eps: float
 
     def __post_init__(self) -> None:
-        if not isinstance(self.manifest_sha256, str) or not SHA256_PATTERN.fullmatch(
-            self.manifest_sha256
+        if not isinstance(self.data_contract_sha256, str) or not SHA256_PATTERN.fullmatch(
+            self.data_contract_sha256
         ):
-            raise ValueError("manifest_sha256 must be a lowercase SHA-256 hex digest")
+            raise ValueError("data_contract_sha256 must be a lowercase SHA-256 hex digest")
+        if not isinstance(self.seed, int) or isinstance(self.seed, bool):
+            raise ValueError("seed must be an integer")
         if (
             not isinstance(self.batch_size, int)
             or isinstance(self.batch_size, bool)
@@ -104,6 +109,8 @@ def save_checkpoint(
     wandb_entity: str | None = None,
     keep_last_n: int | None = None,
     run_config: TrainingRunConfig | None = None,
+    data_position: int = 0,
+    tokens_seen: int = 0,
 ) -> Path:
     """Atomically save the state required to resume training."""
     if not isinstance(step, int) or isinstance(step, bool) or step < 0:
@@ -120,6 +127,10 @@ def save_checkpoint(
         not isinstance(keep_last_n, int) or isinstance(keep_last_n, bool) or keep_last_n <= 0
     ):
         raise ValueError("keep_last_n must be a positive integer or None")
+    if not isinstance(data_position, int) or isinstance(data_position, bool) or data_position < 0:
+        raise ValueError("data_position must be a non-negative integer")
+    if not isinstance(tokens_seen, int) or isinstance(tokens_seen, bool) or tokens_seen < 0:
+        raise ValueError("tokens_seen must be a non-negative integer")
 
     checkpoint_path = Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,6 +150,8 @@ def save_checkpoint(
         "wandb_project": wandb_project,
         "wandb_entity": wandb_entity,
         "run_config": None if run_config is None else asdict(run_config),
+        "data_position": data_position,
+        "tokens_seen": tokens_seen,
     }
 
     try:
@@ -210,6 +223,8 @@ def restore_checkpoint(
     wandb_project = payload.get("wandb_project")
     wandb_entity = payload.get("wandb_entity")
     saved_run_config = payload.get("run_config")
+    data_position = payload.get("data_position", 0)
+    tokens_seen = payload.get("tokens_seen", 0)
     cuda_rng_states = payload.get("cuda_rng_states")
     mps_rng_state = payload.get("mps_rng_state")
     if not isinstance(model_state, dict):
@@ -225,6 +240,9 @@ def restore_checkpoint(
     saved_training_config = dict(saved_training_config)
     if format_version == 1:
         saved_training_config.setdefault("precision", "fp32")
+    if format_version <= 3:
+        saved_training_config.setdefault("learning_rate_schedule", "cosine")
+        saved_training_config.setdefault("decay_start_step", None)
     wandb_run_id = _validate_optional_string(wandb_run_id, "checkpoint wandb_run_id")
     wandb_project = _validate_optional_string(wandb_project, "checkpoint wandb_project")
     wandb_entity = _validate_optional_string(wandb_entity, "checkpoint wandb_entity")
@@ -237,6 +255,10 @@ def restore_checkpoint(
         raise ValueError("checkpoint contains invalid cuda_rng_states")
     if mps_rng_state is not None and not isinstance(mps_rng_state, torch.Tensor):
         raise ValueError("checkpoint contains an invalid mps_rng_state")
+    if not isinstance(data_position, int) or isinstance(data_position, bool) or data_position < 0:
+        raise ValueError("checkpoint contains an invalid data_position")
+    if not isinstance(tokens_seen, int) or isinstance(tokens_seen, bool) or tokens_seen < 0:
+        raise ValueError("checkpoint contains an invalid tokens_seen")
     if model_config != asdict(model.config):
         raise ValueError("checkpoint model_config does not match the current model configuration")
     if saved_training_config != asdict(training_config):
@@ -247,13 +269,26 @@ def restore_checkpoint(
     if expected_run_config is not None:
         if format_version == 1 and saved_run_config is None:
             warnings.warn(
-                "Legacy checkpoint has no run_config; cannot validate manifest, batch, "
+                "Legacy checkpoint has no run_config; cannot validate data, seed, batch, "
                 "or optimizer settings",
                 RuntimeWarning,
                 stacklevel=2,
             )
-        elif saved_run_config != expected_run_config:
-            raise ValueError("checkpoint run_config does not match the current run configuration")
+        else:
+            normalized_run_config = None if saved_run_config is None else dict(saved_run_config)
+            if normalized_run_config is not None and format_version <= 3:
+                legacy_digest = normalized_run_config.pop("manifest_sha256", None)
+                normalized_run_config["data_contract_sha256"] = legacy_digest
+                normalized_run_config["seed"] = expected_run_config["seed"]
+                warnings.warn(
+                    "Legacy checkpoint has no seed in run_config; the seed cannot be validated",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            if normalized_run_config != expected_run_config:
+                raise ValueError(
+                    "checkpoint run_config does not match the current run configuration"
+                )
     if step > training_config.max_steps:
         raise ValueError(
             "checkpoint step cannot exceed training_config.max_steps, "
@@ -276,6 +311,8 @@ def restore_checkpoint(
         wandb_run_id=wandb_run_id,
         wandb_project=wandb_project,
         wandb_entity=wandb_entity,
+        data_position=data_position,
+        tokens_seen=tokens_seen,
     )
 
 
