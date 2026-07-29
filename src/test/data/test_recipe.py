@@ -105,7 +105,7 @@ def test_training_recipe_rejects_a_phase_whose_source_tokens_do_not_sum(
         load_training_recipe(recipe_path)
 
 
-def test_shipped_12b_recipe_has_exact_sequences_and_only_reuses_deduplicated_web() -> None:
+def test_shipped_12b_recipe_has_exact_sequences_and_only_reuses_web_source() -> None:
     repository_root = Path(__file__).parents[3]
     payload = json.loads(
         (repository_root / "configs" / "pretrain_v1_english_12b.json").read_text(encoding="utf-8")
@@ -113,14 +113,23 @@ def test_shipped_12b_recipe_has_exact_sequences_and_only_reuses_deduplicated_web
     stable_phase, decay_phase = payload["phases"]
     sources_by_name = {source["name"]: source for source in payload["sources"]}
 
+    assert stable_phase["tokens"] == 10_800_000_000
+    assert decay_phase["tokens"] == 1_200_000_000
+    assert sum(phase["tokens"] for phase in payload["phases"]) == 12_000_000_000
     for phase in (stable_phase, decay_phase):
         assert sum(phase["source_tokens"].values()) == phase["tokens"]
         assert all(token_count % 1_024 == 0 for token_count in phase["source_tokens"].values())
     assert set(stable_phase["source_tokens"]) & set(decay_phase["source_tokens"]) == {
-        "fineweb_edu_dedup"
+        "fineweb_edu_sample_10bt"
     }
-    assert stable_phase["source_tokens"]["finewiki_en"] == 199_999_488
+    assert stable_phase["source_tokens"]["fineweb_edu_sample_10bt"] == 8_750_000_128
+    assert decay_phase["source_tokens"]["fineweb_edu_sample_10bt"] == 1_050_000_384
+    assert stable_phase["source_tokens"]["finewiki_en"] == 899_999_744
+    assert sources_by_name["fineweb_edu_sample_10bt"]["manifest"] == (
+        "../data/pretrain-v1/fineweb-edu-sample-10bt/manifest.json"
+    )
     assert sources_by_name["finewiki_en"]["manifest"] == (
         "../data/pretrain-v1/finewiki-en/manifest.json"
     )
+    assert "fineweb_edu_dedup" not in sources_by_name
     assert "nemotron_knowledge" not in sources_by_name

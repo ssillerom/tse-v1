@@ -3,8 +3,8 @@
   "name": "v1-english-12b",
   "sources": [
     {
-      "name": "fineweb_edu_dedup",
-      "manifest": "../data/pretrain-v1/fineweb-edu-dedup/manifest.json"
+      "name": "fineweb_edu_sample_10bt",
+      "manifest": "../data/pretrain-v1/fineweb-edu-sample-10bt/manifest.json"
     },
     {
       "name": "stack_v3_python",
@@ -32,17 +32,17 @@
       "name": "stable",
       "tokens": 10800000000,
       "source_tokens": {
-        "fineweb_edu_dedup": 9450000384,
+        "fineweb_edu_sample_10bt": 8750000128,
         "stack_v3_python": 750000128,
         "nemotron_math_3": 400000000,
-        "finewiki_en": 199999488
+        "finewiki_en": 899999744
       }
     },
     {
       "name": "decay",
       "tokens": 1200000000,
       "source_tokens": {
-        "fineweb_edu_dedup": 1050000384,
+        "fineweb_edu_sample_10bt": 1050000384,
         "nemotron_math_4plus": 99999744,
         "nemotron_fact_seeking": 49999872
       }

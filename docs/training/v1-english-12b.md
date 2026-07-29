@@ -19,21 +19,22 @@ training system single-device and uses staged proofs before renting the final H1
   reaching zero on the final update.
 
 The recipe is [`configs/pretrain_v1_english_12b.json`](../../configs/pretrain_v1_english_12b.json).
-Its first source, FineWeb-Edu Dedup, also supplies the held-out validation sequences.
+Its first source, the official FineWeb-Edu `sample-10BT`, also supplies the held-out validation
+sequences.
 
 ## Data mix
 
-The final 1.2B tokens continue farther into the same deduplicated web manifest and switch to
-separate, more heavily filtered mathematics and knowledge manifests. Code appears only in the
-stable phase: preparing the same Stack stream twice would silently repeat its earliest
-repositories during decay.
+The final 1.2B tokens continue farther into the same web manifest and switch to separate, more
+heavily filtered mathematics and knowledge manifests. Code appears only in the stable phase:
+preparing the same Stack stream twice would silently repeat its earliest repositories during
+decay.
 
 | Category | Stable corpus and tokens | Premium decay corpus and tokens |
 |---|---:|---:|
-| Educational web | FineWeb-Edu Dedup, 9.45B | next 1.05B from the same manifest |
+| Educational web | FineWeb-Edu sample-10BT, 8.75B | next 1.05B from the same manifest |
 | Code | Stack v3 permissive Python, 0.75B | — |
 | Mathematics | Nemotron-CC-Math score 3, 0.40B | Nemotron-CC-Math 4plus, 0.10B |
-| Knowledge | FineWiki English, 0.20B | Nemotron Pretraining Fact-Seeking, 0.05B |
+| Knowledge | FineWiki English, 0.90B | Nemotron Pretraining Fact-Seeking, 0.05B |
 | **Total** | **10.80B** | **1.20B** |
 
 The JSON quotas differ from these rounded labels by at most 640 tokens so that every source
@@ -41,29 +42,32 @@ quota is an exact number of 1,024-token sequences.
 
 Before preparing the NVIDIA mathematics source, accept the data agreement on the
 `nvidia/Nemotron-CC-Math-v1` Hub page, run `hf auth login`, and keep `--hf-token` on those
-commands. FineWiki and the specialized v1.2 corpus are public. The FineWiki command below is
-pinned to the tested August 2025 English snapshot. Before the paid pilot, pin every remaining
-source with `--revision` and keep the generated manifests; "latest" is not a reproducible
-revision.
+commands. FineWeb-Edu, FineWiki and the specialized v1.2 corpus are public. Every source
+command below is pinned to its tested revision; keep the generated manifests because "latest"
+is not a reproducible revision.
 
-Prepare slightly more than each training quota because 2% is assigned deterministically to
-validation. The commands below create 100M-token shards and use the same GPT-2 encoding:
+FineWeb-Edu is prepared to the 10B sample cap and assigns 1% to validation, leaving expected
+headroom above its 9.800000512B-token training quota. The other sources prepare slightly more
+than their quotas and assign 2% to validation. The commands below create 100M-token shards
+and use the same GPT-2 encoding:
 
 ```bash
 uv run prepare-data prepare \
-  --dataset-name HuggingFaceTB/smollm-corpus \
-  --name fineweb-edu-dedup \
+  --dataset-name HuggingFaceFW/fineweb-edu \
+  --name sample-10BT \
+  --revision 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9 \
   --split train \
   --text-field text \
-  --output-dir data/pretrain-v1/fineweb-edu-dedup \
-  --num-tokens 10800000000 \
+  --output-dir data/pretrain-v1/fineweb-edu-sample-10bt \
+  --num-tokens 10000000000 \
   --shard-size 100000000 \
-  --validation-ratio 0.02 \
+  --validation-ratio 0.01 \
   --split-seed 42 \
   --encoding gpt2
 
 uv run prepare-data prepare \
   --dataset-name HuggingFaceCode/stack-v3-train \
+  --revision 2b4797afd5677e32630c2247a6a8092e1a5afa03 \
   --split train \
   --records-field files \
   --record-filter language=Python,license_type=permissive \
@@ -79,6 +83,7 @@ uv run prepare-data prepare \
 uv run prepare-data prepare \
   --dataset-name nvidia/Nemotron-CC-Math-v1 \
   --name 3 \
+  --revision 397a2502f2028c659ba411a6c4935b464a7f03aa \
   --split train \
   --text-field text \
   --hf-token \
@@ -96,7 +101,7 @@ uv run prepare-data prepare \
   --split train \
   --text-field text \
   --output-dir data/pretrain-v1/finewiki-en \
-  --num-tokens 210000000 \
+  --num-tokens 930000000 \
   --shard-size 100000000 \
   --validation-ratio 0.02 \
   --split-seed 42 \
@@ -105,6 +110,7 @@ uv run prepare-data prepare \
 uv run prepare-data prepare \
   --dataset-name nvidia/Nemotron-CC-Math-v1 \
   --name 4plus \
+  --revision 397a2502f2028c659ba411a6c4935b464a7f03aa \
   --split train \
   --text-field text \
   --hf-token \
@@ -118,6 +124,7 @@ uv run prepare-data prepare \
 uv run prepare-data prepare \
   --dataset-name nvidia/Nemotron-Pretraining-Specialized-v1.2 \
   --name Nemotron-Pretraining-Fact-Seeking \
+  --revision 807afc1fa65c441d46ebc7d9b95295a35499a527 \
   --split train \
   --text-field text \
   --output-dir data/pretrain-v1/nemotron-fact-seeking \
@@ -131,22 +138,22 @@ uv run prepare-data prepare \
 Stack v3 stores one repository per row and the source files in `files[].content`; it has no
 per-language configuration. The nested-record options above flatten those files and apply
 both filters. This deliberately keeps only Python files labelled `permissive`, although the
-dataset license and each original source license still need to be respected. FineWeb-Edu
-Dedup is prepared once: the deterministic sampler counts prior uses of a source, so its decay
-slice starts after the 9.45B stable-token quota instead of replaying the beginning. Nemotron Math
-publishes configs `3`, `4plus`, and `4plus_MIND`; its card defines “3plus” as the union of
-`3` and `4plus`, not as a loadable config. This recipe keeps them disjoint: score 3 supplies
-the broad stable slice, and scores 4–5 are reserved for decay. The small Fact-Seeking slice
-is synthetic question-answer text, so it is capped at 50M tokens to avoid turning the base
-model into an instruction model. Nemotron SFT Math is intentionally excluded because
-supervised reasoning trajectories belong after base pretraining.
+dataset license and each original source license still need to be respected. The FineWeb-Edu
+sample is prepared once: the deterministic sampler counts prior uses of a source, so its
+decay slice starts after the 8.75B stable-token quota instead of replaying the beginning.
+Nemotron Math publishes configs `3`, `4plus`, and `4plus_MIND`; its card defines “3plus” as
+the union of `3` and `4plus`, not as a loadable config. This recipe keeps them disjoint: score
+3 supplies the broad stable slice, and scores 4–5 are reserved for decay. The small
+Fact-Seeking slice is synthetic question-answer text, so it is capped at 50M tokens to avoid
+turning the base model into an instruction model. Nemotron SFT Math is intentionally excluded
+because supervised reasoning trajectories belong after base pretraining.
 
 After preparation, inspect all six manifests. Each `train.tokens` count must exceed its
 recipe quota, and the tokenizer metadata must be identical:
 
 ```bash
 uv run inspect-data-slices \
-  --manifest data/pretrain-v1/fineweb-edu-dedup/manifest.json \
+  --manifest data/pretrain-v1/fineweb-edu-sample-10bt/manifest.json \
   --split train \
   --seq-len 1024 \
   --num-examples 3
