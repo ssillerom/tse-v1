@@ -175,6 +175,67 @@ def load_streaming_hf_dataset(
     return cast(Iterable[Mapping[str, object]], load_dataset(**kwargs))
 
 
+def _parse_record_filter(
+    record_filter: str | None,
+) -> tuple[tuple[str, str], ...]:
+    if record_filter is None:
+        return ()
+
+    filters: list[tuple[str, str]] = []
+    for clause in record_filter.split(","):
+        field, separator, value = clause.partition("=")
+        field = field.strip()
+        value = value.strip()
+        if not separator or not field or not value:
+            raise ValueError("record_filter must use FIELD=VALUE clauses separated by commas")
+        filters.append((field, value))
+    return tuple(filters)
+
+
+def _iter_source_documents(
+    dataset: Iterable[Mapping[str, object]],
+    records_field: str | None,
+    record_filters: Sequence[tuple[str, str]],
+) -> Iterable[Mapping[str, object]]:
+    """Yield top-level documents or selected records from one nested list field."""
+    if records_field is None:
+        yield from dataset
+        return
+
+    for source_record in dataset:
+        if records_field not in source_record:
+            raise KeyError(
+                f"records_field={records_field!r} not found. "
+                f"Available keys: {list(source_record.keys())}"
+            )
+        nested_records = source_record[records_field]
+        if not isinstance(nested_records, Sequence) or isinstance(nested_records, (str, bytes)):
+            raise TypeError(f"records_field={records_field!r} must contain a sequence")
+
+        for position, nested_record in enumerate(nested_records):
+            if not isinstance(nested_record, Mapping):
+                raise TypeError(
+                    f"record {position} in records_field={records_field!r} must be a mapping"
+                )
+            missing_filter_fields = [
+                filter_field
+                for filter_field, _ in record_filters
+                if filter_field not in nested_record
+            ]
+            if missing_filter_fields:
+                raise KeyError(
+                    f"filter fields {missing_filter_fields!r} not found in record {position} "
+                    f"of records_field={records_field!r}. "
+                    f"Available keys: {list(nested_record.keys())}"
+                )
+            if any(
+                nested_record[filter_field] != filter_value
+                for filter_field, filter_value in record_filters
+            ):
+                continue
+            yield nested_record
+
+
 def inspect_dataset(
     dataset_name: str,
     split: str = "train",
@@ -491,6 +552,8 @@ def prepare_streaming_dataset(
     split_seed: int = 42,
     encoding_name: str = "gpt2",
     overwrite: bool = False,
+    records_field: str | None = None,
+    record_filter: str | None = None,
 ) -> dict[str, object]:
     """Stream, tokenize, and transactionally replace a dataset and its manifest."""
     _validate_preparation_limits(
@@ -501,6 +564,11 @@ def prepare_streaming_dataset(
         max_docs,
         validation_ratio,
     )
+    if records_field is not None and not records_field:
+        raise ValueError("records_field must be non-empty when provided")
+    if records_field is None and record_filter is not None:
+        raise ValueError("record_filter requires records_field")
+    parsed_record_filter = _parse_record_filter(record_filter)
 
     encoding = tiktoken.get_encoding(encoding_name)
     if encoding.max_token_value > UINT16_MAX:
@@ -518,13 +586,17 @@ def prepare_streaming_dataset(
             "Pass overwrite=True only if replacing them is intentional."
         )
 
-    dataset = load_streaming_hf_dataset(
-        dataset_name=dataset_name,
-        split=split,
-        name=name,
-        data_dir=data_dir,
-        revision=revision,
-        hf_token=hf_token,
+    dataset = _iter_source_documents(
+        dataset=load_streaming_hf_dataset(
+            dataset_name=dataset_name,
+            split=split,
+            name=name,
+            data_dir=data_dir,
+            revision=revision,
+            hf_token=hf_token,
+        ),
+        records_field=records_field,
+        record_filters=parsed_record_filter,
     )
     dataset_manifest: dict[str, object] = {
         "path": dataset_name,
@@ -534,6 +606,9 @@ def prepare_streaming_dataset(
         "revision": revision,
         "text_field": text_field,
     }
+    if records_field is not None:
+        dataset_manifest["records_field"] = records_field
+        dataset_manifest["record_filter"] = record_filter
 
     with tempfile.TemporaryDirectory(
         prefix=".prepare-data-staging-",
@@ -584,6 +659,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_dataset_arguments(prepare_parser)
     prepare_parser.add_argument("--output-dir", required=True)
     prepare_parser.add_argument("--text-field", required=True)
+    prepare_parser.add_argument(
+        "--records-field",
+        help="Flatten records from this nested sequence field before reading text",
+    )
+    prepare_parser.add_argument(
+        "--record-filter",
+        help=(
+            "Keep nested records matching every FIELD=VALUE clause, separated by commas; "
+            "requires --records-field"
+        ),
+    )
     prepare_parser.add_argument("--num-tokens", required=True, type=int)
     prepare_parser.add_argument("--shard-size", type=int, default=100_000_000)
     prepare_parser.add_argument("--min-chars", type=int, default=0)
@@ -640,6 +726,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset_name=args.dataset_name,
         text_field=args.text_field,
         num_tokens=args.num_tokens,
+        records_field=args.records_field,
+        record_filter=args.record_filter,
         shard_size=args.shard_size,
         split=args.split,
         name=args.name,

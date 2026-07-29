@@ -3,36 +3,28 @@
   "name": "v1-english-12b",
   "sources": [
     {
-      "name": "fineweb_edu",
-      "manifest": "../data/pretrain-v1/fineweb-edu/manifest.json"
+      "name": "fineweb_edu_dedup",
+      "manifest": "../data/pretrain-v1/fineweb-edu-dedup/manifest.json"
     },
     {
-      "name": "code",
-      "manifest": "../data/pretrain-v1/code/manifest.json"
+      "name": "stack_v3_python",
+      "manifest": "../data/pretrain-v1/stack-v3-python/manifest.json"
     },
     {
-      "name": "finemath",
-      "manifest": "../data/pretrain-v1/finemath/manifest.json"
+      "name": "nemotron_math_3",
+      "manifest": "../data/pretrain-v1/nemotron-math-3/manifest.json"
     },
     {
-      "name": "wikipedia",
-      "manifest": "../data/pretrain-v1/wikipedia-en/manifest.json"
+      "name": "nemotron_knowledge",
+      "manifest": "../data/pretrain-v1/nemotron-knowledge-high-quality/manifest.json"
     },
     {
-      "name": "fineweb_edu_premium",
-      "manifest": "../data/pretrain-v1/fineweb-edu-premium/manifest.json"
+      "name": "nemotron_math_4plus",
+      "manifest": "../data/pretrain-v1/nemotron-math-4plus/manifest.json"
     },
     {
-      "name": "code_premium",
-      "manifest": "../data/pretrain-v1/code-premium/manifest.json"
-    },
-    {
-      "name": "finemath_premium",
-      "manifest": "../data/pretrain-v1/finemath-premium/manifest.json"
-    },
-    {
-      "name": "knowledge_premium",
-      "manifest": "../data/pretrain-v1/knowledge-premium/manifest.json"
+      "name": "nemotron_fact_seeking",
+      "manifest": "../data/pretrain-v1/nemotron-fact-seeking/manifest.json"
     }
   ],
   "phases": [
@@ -40,20 +32,19 @@
       "name": "stable",
       "tokens": 10800000000,
       "source_tokens": {
-        "fineweb_edu": 9600000000,
-        "code": 600000512,
-        "finemath": 400000000,
-        "wikipedia": 199999488
+        "fineweb_edu_dedup": 9450000384,
+        "stack_v3_python": 750000128,
+        "nemotron_math_3": 400000000,
+        "nemotron_knowledge": 199999488
       }
     },
     {
       "name": "decay",
       "tokens": 1200000000,
       "source_tokens": {
-        "fineweb_edu_premium": 899999744,
-        "code_premium": 150000640,
-        "finemath_premium": 99999744,
-        "knowledge_premium": 49999872
+        "fineweb_edu_dedup": 1050000384,
+        "nemotron_math_4plus": 99999744,
+        "nemotron_fact_seeking": 49999872
       }
     }
   ]

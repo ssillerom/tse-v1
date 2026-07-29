@@ -9,6 +9,7 @@ causales, una arquitectura V1 probada y un loop de entrenamiento reanudable.
 El pipeline de datos ya permite:
 
 - leer datasets de Hugging Face en streaming;
+- extraer y filtrar registros anidados, como los archivos Python de Stack v3;
 - tokenizar documentos con una codificación de `tiktoken` compatible con `uint16`;
 - limitar una preparación por documentos y tokens;
 - separar train y validation mediante un hash de contenido reproducible;

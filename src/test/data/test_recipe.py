@@ -105,7 +105,7 @@ def test_training_recipe_rejects_a_phase_whose_source_tokens_do_not_sum(
         load_training_recipe(recipe_path)
 
 
-def test_shipped_12b_recipe_has_exact_sequences_and_separate_decay_sources() -> None:
+def test_shipped_12b_recipe_has_exact_sequences_and_only_reuses_deduplicated_web() -> None:
     repository_root = Path(__file__).parents[3]
     payload = json.loads(
         (repository_root / "configs" / "pretrain_v1_english_12b.json").read_text(encoding="utf-8")
@@ -115,4 +115,6 @@ def test_shipped_12b_recipe_has_exact_sequences_and_separate_decay_sources() -> 
     for phase in (stable_phase, decay_phase):
         assert sum(phase["source_tokens"].values()) == phase["tokens"]
         assert all(token_count % 1_024 == 0 for token_count in phase["source_tokens"].values())
-    assert set(stable_phase["source_tokens"]).isdisjoint(decay_phase["source_tokens"])
+    assert set(stable_phase["source_tokens"]) & set(decay_phase["source_tokens"]) == {
+        "fineweb_edu_dedup"
+    }

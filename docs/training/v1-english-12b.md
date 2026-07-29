@@ -19,57 +19,69 @@ training system single-device and uses staged proofs before renting the final H1
   reaching zero on the final update.
 
 The recipe is [`configs/pretrain_v1_english_12b.json`](../../configs/pretrain_v1_english_12b.json).
-Its first source, FineWeb-Edu, also supplies the held-out validation sequences.
+Its first source, FineWeb-Edu Dedup, also supplies the held-out validation sequences.
 
 ## Data mix
 
-The last 1.2B tokens do not merely reweight the original streams. They come from separate,
-more heavily filtered manifests:
+The final 1.2B tokens continue farther into the same deduplicated web manifest and switch to
+separate, more heavily filtered mathematics and knowledge manifests. Code appears only in the
+stable phase: preparing the same Stack stream twice would silently repeat its earliest
+repositories during decay.
 
 | Category | Stable corpus and tokens | Premium decay corpus and tokens |
 |---|---:|---:|
-| Educational web | FineWeb-Edu, 9.60B | FineWeb-Edu Dedup, 0.90B |
-| Code | GitHub Code, 0.60B | filtered CodeParrot Python, 0.15B |
-| Mathematics | FineMath 3+, 0.40B | FineMath 4+, 0.10B |
-| Knowledge | English Wikipedia, 0.20B | Cosmopedia v2, 0.05B |
+| Educational web | FineWeb-Edu Dedup, 9.45B | next 1.05B from the same manifest |
+| Code | Stack v3 permissive Python, 0.75B | — |
+| Mathematics | Nemotron-CC-Math score 3, 0.40B | Nemotron-CC-Math 4plus, 0.10B |
+| Knowledge | Nemotron-CC v2.1 High-Quality, 0.20B | Nemotron Pretraining Fact-Seeking, 0.05B |
 | **Total** | **10.80B** | **1.20B** |
 
 The JSON quotas differ from these rounded labels by at most 640 tokens so that every source
 quota is an exact number of 1,024-token sequences.
+
+Before preparing the NVIDIA sources, accept the data agreements on the
+`nvidia/Nemotron-CC-Math-v1` and `nvidia/Nemotron-CC-v2.1` Hub pages, run `hf auth login`,
+and keep `--hf-token` on those commands. The specialized v1.2 corpus is public. Once the
+recipe has passed its pilot, pin each source with `--revision` and keep the generated
+manifests; "latest" is not a reproducible revision.
 
 Prepare slightly more than each training quota because 2% is assigned deterministically to
 validation. The commands below create 100M-token shards and use the same GPT-2 encoding:
 
 ```bash
 uv run prepare-data prepare \
-  --dataset-name HuggingFaceFW/fineweb-edu \
-  --name sample-100BT \
+  --dataset-name HuggingFaceTB/smollm-corpus \
+  --name fineweb-edu-dedup \
   --split train \
   --text-field text \
-  --output-dir data/pretrain-v1/fineweb-edu \
-  --num-tokens 9800000000 \
+  --output-dir data/pretrain-v1/fineweb-edu-dedup \
+  --num-tokens 10800000000 \
   --shard-size 100000000 \
   --validation-ratio 0.02 \
   --split-seed 42 \
   --encoding gpt2
 
 uv run prepare-data prepare \
-  --dataset-name codeparrot/github-code \
+  --dataset-name HuggingFaceCode/stack-v3-train \
   --split train \
-  --text-field code \
-  --output-dir data/pretrain-v1/code \
-  --num-tokens 620000000 \
+  --records-field files \
+  --record-filter language=Python,license_type=permissive \
+  --text-field content \
+  --output-dir data/pretrain-v1/stack-v3-python \
+  --num-tokens 770000000 \
   --shard-size 100000000 \
+  --min-chars 64 \
   --validation-ratio 0.02 \
   --split-seed 42 \
   --encoding gpt2
 
 uv run prepare-data prepare \
-  --dataset-name HuggingFaceTB/finemath \
-  --name finemath-3plus \
+  --dataset-name nvidia/Nemotron-CC-Math-v1 \
+  --name 3 \
   --split train \
   --text-field text \
-  --output-dir data/pretrain-v1/finemath \
+  --hf-token \
+  --output-dir data/pretrain-v1/nemotron-math-3 \
   --num-tokens 415000000 \
   --shard-size 100000000 \
   --validation-ratio 0.02 \
@@ -77,11 +89,12 @@ uv run prepare-data prepare \
   --encoding gpt2
 
 uv run prepare-data prepare \
-  --dataset-name wikimedia/wikipedia \
-  --name 20231101.en \
+  --dataset-name nvidia/Nemotron-CC-v2.1 \
+  --name High-Quality \
   --split train \
   --text-field text \
-  --output-dir data/pretrain-v1/wikipedia-en \
+  --hf-token \
+  --output-dir data/pretrain-v1/nemotron-knowledge-high-quality \
   --num-tokens 210000000 \
   --shard-size 100000000 \
   --validation-ratio 0.02 \
@@ -89,34 +102,12 @@ uv run prepare-data prepare \
   --encoding gpt2
 
 uv run prepare-data prepare \
-  --dataset-name HuggingFaceTB/smollm-corpus \
-  --name fineweb-edu-dedup \
+  --dataset-name nvidia/Nemotron-CC-Math-v1 \
+  --name 4plus \
   --split train \
   --text-field text \
-  --output-dir data/pretrain-v1/fineweb-edu-premium \
-  --num-tokens 930000000 \
-  --shard-size 100000000 \
-  --validation-ratio 0.02 \
-  --split-seed 42 \
-  --encoding gpt2
-
-uv run prepare-data prepare \
-  --dataset-name codeparrot/codeparrot-train-more-filtering \
-  --split train \
-  --text-field content \
-  --output-dir data/pretrain-v1/code-premium \
-  --num-tokens 160000000 \
-  --shard-size 100000000 \
-  --validation-ratio 0.02 \
-  --split-seed 42 \
-  --encoding gpt2
-
-uv run prepare-data prepare \
-  --dataset-name HuggingFaceTB/finemath \
-  --name finemath-4plus \
-  --split train \
-  --text-field text \
-  --output-dir data/pretrain-v1/finemath-premium \
+  --hf-token \
+  --output-dir data/pretrain-v1/nemotron-math-4plus \
   --num-tokens 110000000 \
   --shard-size 100000000 \
   --validation-ratio 0.02 \
@@ -124,11 +115,11 @@ uv run prepare-data prepare \
   --encoding gpt2
 
 uv run prepare-data prepare \
-  --dataset-name HuggingFaceTB/smollm-corpus \
-  --name cosmopedia-v2 \
+  --dataset-name nvidia/Nemotron-Pretraining-Specialized-v1.2 \
+  --name Nemotron-Pretraining-Fact-Seeking \
   --split train \
   --text-field text \
-  --output-dir data/pretrain-v1/knowledge-premium \
+  --output-dir data/pretrain-v1/nemotron-fact-seeking \
   --num-tokens 60000000 \
   --shard-size 100000000 \
   --validation-ratio 0.02 \
@@ -136,18 +127,25 @@ uv run prepare-data prepare \
   --encoding gpt2
 ```
 
-`HuggingFaceTB/stack-edu` would be preferable to the stable code fallback, but its Hub rows
-contain Software Heritage blob IDs rather than source text. The generic streaming preparer
-cannot materialize those blobs yet. The premium code stream is nevertheless separate and
-more strongly filtered than the stable stream. Review every source license before publishing
-a trained model.
+Stack v3 stores one repository per row and the source files in `files[].content`; it has no
+per-language configuration. The nested-record options above flatten those files and apply
+both filters. This deliberately keeps only Python files labelled `permissive`, although the
+dataset license and each original source license still need to be respected. FineWeb-Edu
+Dedup is prepared once: the deterministic sampler counts prior uses of a source, so its decay
+slice starts after the 9.45B stable-token quota instead of replaying the beginning. Nemotron Math
+publishes configs `3`, `4plus`, and `4plus_MIND`; its card defines “3plus” as the union of
+`3` and `4plus`, not as a loadable config. This recipe keeps them disjoint: score 3 supplies
+the broad stable slice, and scores 4–5 are reserved for decay. The small Fact-Seeking slice
+is synthetic question-answer text, so it is capped at 50M tokens to avoid turning the base
+model into an instruction model. Nemotron SFT Math is intentionally excluded because
+supervised reasoning trajectories belong after base pretraining.
 
-After preparation, inspect all eight manifests. Each `train.tokens` count must exceed its
+After preparation, inspect all six manifests. Each `train.tokens` count must exceed its
 recipe quota, and the tokenizer metadata must be identical:
 
 ```bash
 uv run inspect-data-slices \
-  --manifest data/pretrain-v1/fineweb-edu/manifest.json \
+  --manifest data/pretrain-v1/fineweb-edu-dedup/manifest.json \
   --split train \
   --seq-len 1024 \
   --num-examples 3

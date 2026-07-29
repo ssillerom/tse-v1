@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import tiktoken
 
 from data.prepare_data import (
     TokenShardWriter,
@@ -226,6 +227,114 @@ def test_prepare_writes_a_reproducible_manifest(
         "shards": [{"file": "shard_0000.bin", "split": "train", "tokens": 2}],
     }
     assert received_arguments["revision"] == "fixed-revision"
+
+
+def test_prepare_can_flatten_and_filter_nested_source_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_load_dataset(**kwargs: object) -> list[dict[str, object]]:
+        del kwargs
+        return [
+            {
+                "repo_path": "example/project",
+                "files": [
+                    {
+                        "language": "Python",
+                        "license_type": "permissive",
+                        "content": "def add(a, b):\n    return a + b\n",
+                    },
+                    {
+                        "language": "JavaScript",
+                        "license_type": "permissive",
+                        "content": "const add = (a, b) => a + b;\n",
+                    },
+                    {
+                        "language": "Python",
+                        "license_type": "permissive",
+                        "content": "print(add(2, 3))\n",
+                    },
+                    {
+                        "language": "Python",
+                        "license_type": "no_license",
+                        "content": "print('exclude unclear licensing')\n",
+                    },
+                ],
+            }
+        ]
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+
+    manifest = prepare_streaming_dataset(
+        output_dir=tmp_path,
+        dataset_name="HuggingFaceCode/stack-v3-train",
+        records_field="files",
+        record_filter="language=Python,license_type=permissive",
+        text_field="content",
+        num_tokens=1_000,
+        shard_size=1_000,
+    )
+
+    assert manifest["dataset"] == {
+        "path": "HuggingFaceCode/stack-v3-train",
+        "name": None,
+        "data_dir": None,
+        "split": "train",
+        "revision": None,
+        "records_field": "files",
+        "record_filter": "language=Python,license_type=permissive",
+        "text_field": "content",
+    }
+    assert manifest["counts"]["docs_seen"] == 2
+    assert manifest["counts"]["docs_used"] == 2
+
+    encoding = tiktoken.get_encoding("gpt2")
+    token_ids = np.fromfile(tmp_path / "shard_0000.bin", dtype=np.uint16).tolist()
+    documents: list[str] = []
+    document_tokens: list[int] = []
+    for token_id in token_ids:
+        if token_id == encoding.eot_token:
+            documents.append(encoding.decode(document_tokens))
+            document_tokens = []
+        else:
+            document_tokens.append(token_id)
+    assert documents == [
+        "def add(a, b):\n    return a + b\n",
+        "print(add(2, 3))\n",
+    ]
+
+
+def test_prepare_rejects_an_unknown_nested_filter_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_load_dataset(**kwargs: object) -> list[dict[str, object]]:
+        del kwargs
+        return [{"files": [{"language": "Python", "content": "print('hello')"}]}]
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+
+    with pytest.raises(KeyError, match="license_type"):
+        prepare_streaming_dataset(
+            output_dir=tmp_path,
+            dataset_name="example/nested",
+            records_field="files",
+            record_filter="language=Python, license_type=permissive",
+            text_field="content",
+            num_tokens=100,
+            shard_size=100,
+        )
+
+
+def test_prepare_rejects_a_malformed_nested_record_filter(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="FIELD=VALUE"):
+        prepare_streaming_dataset(
+            output_dir=tmp_path,
+            dataset_name="example/nested",
+            records_field="files",
+            record_filter="language=Python,",
+            text_field="content",
+            num_tokens=100,
+            shard_size=100,
+        )
 
 
 def test_prepare_limits_documents_and_creates_a_deterministic_validation_split(
@@ -468,6 +577,10 @@ def test_cli_exposes_prepare_configuration() -> None:
             "data/example",
             "--text-field",
             "text",
+            "--records-field",
+            "files",
+            "--record-filter",
+            "language=Python,license_type=permissive",
             "--num-tokens",
             "100",
             "--revision",
@@ -493,7 +606,20 @@ def test_cli_exposes_prepare_configuration() -> None:
         arguments.validation_ratio,
         arguments.split_seed,
         arguments.overwrite,
-    ) == ("prepare", 100, "fixed", "gpt2", 50, 0.1, 7, True)
+        arguments.records_field,
+        arguments.record_filter,
+    ) == (
+        "prepare",
+        100,
+        "fixed",
+        "gpt2",
+        50,
+        0.1,
+        7,
+        True,
+        "files",
+        "language=Python,license_type=permissive",
+    )
 
 
 def test_cli_prepare_executes_with_parsed_arguments(
