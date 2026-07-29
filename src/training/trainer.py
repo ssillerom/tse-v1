@@ -3,17 +3,21 @@
 import math
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from numbers import Real
+from typing import Literal
 
 import torch
 
 from src.model.gpt import GPT, IGNORE_INDEX
 
 from .evaluation import perplexity_from_loss
+from .rng import capture_torch_rng_state, restore_torch_rng_state
 from .scheduler import get_learning_rate
 
 Batch = tuple[torch.Tensor, torch.Tensor]
+Precision = Literal["fp32", "bf16"]
 
 
 def _validate_max_grad_norm(max_grad_norm: object) -> None:
@@ -24,6 +28,36 @@ def _validate_max_grad_norm(max_grad_norm: object) -> None:
         or max_grad_norm <= 0
     ):
         raise ValueError(f"max_grad_norm must be finite and positive, got {max_grad_norm!r}")
+
+
+def _validate_precision_device(
+    device: torch.device | str,
+    precision: Precision,
+) -> torch.device:
+    resolved_device = torch.device(device)
+    if precision not in ("fp32", "bf16"):
+        raise ValueError(f"precision must be one of ('fp32', 'bf16'), got {precision!r}")
+    if precision == "bf16" and resolved_device.type not in ("cpu", "cuda"):
+        raise ValueError(
+            f"bf16 precision is supported only on CPU or CUDA, got device {resolved_device.type!r}"
+        )
+    if (
+        precision == "bf16"
+        and resolved_device.type == "cuda"
+        and not torch.cuda.is_bf16_supported()
+    ):
+        raise ValueError("bf16 precision is not supported by the requested CUDA device")
+    return resolved_device
+
+
+def _forward_precision_context(
+    device: torch.device | str,
+    precision: Precision,
+) -> AbstractContextManager[None]:
+    resolved_device = _validate_precision_device(device, precision)
+    if precision == "fp32":
+        return nullcontext()
+    return torch.autocast(device_type=resolved_device.type, dtype=torch.bfloat16)
 
 
 @dataclass(frozen=True)
@@ -38,6 +72,7 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     eval_interval: int | None = None
     eval_batches: int | None = None
+    precision: Precision = "fp32"
 
     def __post_init__(self) -> None:
         if (
@@ -65,6 +100,8 @@ class TrainingConfig:
             raise ValueError(f"eval_batches must be a positive integer, got {self.eval_batches!r}")
         if self.eval_batches is not None and self.eval_interval is None:
             raise ValueError("eval_batches requires eval_interval")
+        if self.precision not in ("fp32", "bf16"):
+            raise ValueError(f"precision must be one of ('fp32', 'bf16'), got {self.precision!r}")
 
         get_learning_rate(
             step=0,
@@ -106,8 +143,10 @@ def evaluate(
     batches: Iterable[Batch],
     device: torch.device | str,
     max_batches: int | None = None,
+    precision: Precision = "fp32",
 ) -> float:
     """Return token-weighted mean loss without changing the caller's model mode."""
+    _validate_precision_device(device, precision)
     if max_batches is not None and (
         not isinstance(max_batches, int) or isinstance(max_batches, bool) or max_batches <= 0
     ):
@@ -129,7 +168,8 @@ def evaluate(
                     continue
                 input_ids = input_ids.to(device)
                 targets = targets.to(device)
-                _, loss = model(input_ids, targets)
+                with _forward_precision_context(device, precision):
+                    _, loss = model(input_ids, targets)
                 if loss is None:
                     raise RuntimeError("model did not return a loss for an evaluation batch")
                 if not torch.isfinite(loss):
@@ -167,9 +207,7 @@ def _batch_iterator_at_step(
     if completed_steps == 0:
         return iter(batches), 0
 
-    cpu_rng_state = torch.random.get_rng_state()
-    cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    mps_rng_state = torch.mps.get_rng_state() if torch.backends.mps.is_available() else None
+    rng_snapshot = capture_torch_rng_state()
     try:
         batch_iterator = iter(batches)
         tokens_seen = 0
@@ -178,11 +216,7 @@ def _batch_iterator_at_step(
             tokens_seen += int((batch[1] != IGNORE_INDEX).sum().item())
         return batch_iterator, tokens_seen
     finally:
-        torch.random.set_rng_state(cpu_rng_state)
-        if cuda_rng_states is not None:
-            torch.cuda.set_rng_state_all(cuda_rng_states)
-        if mps_rng_state is not None:
-            torch.mps.set_rng_state(mps_rng_state)
+        restore_torch_rng_state(rng_snapshot)
 
 
 def _synchronize_device(device: torch.device | str) -> None:
@@ -271,6 +305,7 @@ def train(
             microbatches=microbatches,
             max_grad_norm=config.max_grad_norm,
             device=device,
+            precision=config.precision,
         )
         _synchronize_device(device)
         step_time_seconds = time.perf_counter() - step_started_at
@@ -289,6 +324,7 @@ def train(
                 batches=validation_batches,
                 device=device,
                 max_batches=config.eval_batches,
+                precision=config.precision,
             )
             validation_perplexity = perplexity_from_loss(validation_loss)
 
@@ -317,8 +353,10 @@ def train_step(
     microbatches: Sequence[Batch],
     max_grad_norm: float,
     device: torch.device | str,
+    precision: Precision = "fp32",
 ) -> tuple[float, float]:
     """Run one optimizer update over one or more accumulated microbatches."""
+    _validate_precision_device(device, precision)
     if not microbatches:
         raise ValueError("microbatches must contain at least one batch")
     _validate_max_grad_norm(max_grad_norm)
@@ -340,7 +378,8 @@ def train_step(
             continue
         input_ids = input_ids.to(device)
         targets = targets.to(device)
-        _, loss = model(input_ids, targets)
+        with _forward_precision_context(device, precision):
+            _, loss = model(input_ids, targets)
         if loss is None:
             raise RuntimeError("model did not return a loss for a training batch")
         if not torch.isfinite(loss):

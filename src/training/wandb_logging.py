@@ -22,6 +22,8 @@ from .trainer import StepMetrics
 class WandbRun(Protocol):
     """The small part of a W&B run required by this logger."""
 
+    id: str
+
     def log(self, data: dict[str, object]) -> None: ...
 
     def define_metric(

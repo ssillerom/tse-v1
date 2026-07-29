@@ -99,17 +99,53 @@ tiempo por step y tokens por segundo sin incluir el coste de evaluación:
 uv run train-v1 \
   --manifest data/fineweb-edu-50/manifest.json \
   --device auto \
+  --precision auto \
   --max-steps 500 \
   --eval-interval 50 \
   --sample-interval 100 \
   --checkpoint-interval 100 \
+  --keep-last-checkpoints 3 \
   --wandb-project llm-from-scratch \
+  --wandb-entity your-team \
   --wandb-name v1-smoke-001
 ```
 
 Los prompts son fijos durante toda la ejecución para poder comparar checkpoints sin introducir
 azar de sampling. La evaluación frecuente usa como máximo `--eval-batches 20`; el checkpoint
-final se guarda incluso si el último step no coincide con el intervalo.
+final se guarda incluso si el último step no coincide con el intervalo. `--precision auto`
+selecciona autocast BF16 cuando CUDA y la GPU lo soportan, y FP32 en los demás casos. El modelo
+y los estados de AdamW se mantienen en FP32; BF16 reduce el coste de las operaciones del
+forward y backward.
+
+Por defecto se conservan sólo los tres checkpoints con mayor step. Para continuar el mismo
+entrenamiento y la misma ejecución de W&B, usa el directorio y la configuración originales:
+
+```bash
+uv run train-v1 \
+  --manifest data/fineweb-edu-50/manifest.json \
+  --checkpoint-dir checkpoints/v1 \
+  --resume latest \
+  --wandb-project llm-from-scratch
+```
+
+`--resume latest` prueba los checkpoints desde el step más reciente y, si encuentra uno
+ilegible o incompatible, avisa y retrocede al anterior. También se puede pasar una ruta exacta
+a `--resume`. El checkpoint restaura pesos, AdamW, step, configuración, RNG de CPU/CUDA/MPS y
+la identidad completa de W&B (entity, proyecto e identificador). Al reanudar exige que ese run
+ya exista, en vez de crear silenciosamente uno nuevo. Antes de continuar también valida el
+manifest, batch size y los hiperparámetros de AdamW que determinan la posición de datos y la
+siguiente actualización. La
+evaluación y las muestras realizadas al abrir el run preservan el RNG restaurado. Como el
+learning-rate schedule es una función del step y de la configuración guardada, no necesita un
+objeto de scheduler separado.
+
+Los checkpoints antiguos de formato v1 todavía se pueden abrir. Como no guardaban el hash del
+manifest, el batch size ni la configuración exacta del optimizador, la carga avisa de que no
+puede verificar esos datos antes de continuar.
+
+Cada experimento debe usar un `--checkpoint-dir` exclusivo: la retención se aplica a todos los
+archivos `step_*.pt` de ese directorio. Esto evita mezclar estados pertenecientes a runs
+distintos.
 
 Para probar el flujo completo sin iniciar sesión ni acceder a la red:
 
@@ -144,7 +180,8 @@ documentos pequeños y escriben shards reales en directorios temporales.
 - Los shards no incluyen todavía checksums ni reanudación de una preparación interrumpida.
 - La tokenización es de un solo proceso.
 - Las secuencias no cruzan fronteras de shard; la cola incompleta de cada shard se descarta.
-- El entrenamiento actual es de un solo dispositivo y no usa mixed precision.
+- El entrenamiento actual es de un solo dispositivo; CUDA usa BF16 con
+  `--precision auto` cuando el hardware lo soporta.
 - La reproducción exacta del orden de datos al reanudar requiere un iterable determinista que
   pueda reiniciarse; todavía no se guarda el estado de samplers aleatorios o distribuidos.
 - FineWeb-Edu sirve para validar el pipeline en inglés, no como corpus bilingüe final.

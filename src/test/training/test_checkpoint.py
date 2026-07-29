@@ -5,7 +5,13 @@ import torch
 
 from model.config import ModelConfig
 from model.gpt import GPT
-from training.checkpoint import load_checkpoint, save_checkpoint
+from training.checkpoint import (
+    TrainingRunConfig,
+    load_checkpoint,
+    restore_checkpoint,
+    restore_latest_checkpoint,
+    save_checkpoint,
+)
 from training.trainer import TrainingConfig, train_step
 
 
@@ -105,6 +111,314 @@ def test_checkpoint_restores_training_state_and_can_continue(tmp_path: Path) -> 
         strict=True,
     ):
         torch.testing.assert_close(restored, expected, rtol=0.0, atol=0.0)
+
+
+def test_checkpoint_restores_the_wandb_run_identity(tmp_path: Path) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=1)
+    checkpoint_path = save_checkpoint(
+        path=tmp_path / "step_000000.pt",
+        model=model,
+        optimizer=optimizer,
+        step=0,
+        training_config=training_config,
+        wandb_run_id="wandb-run-123",
+        wandb_project="llm-from-scratch",
+        wandb_entity="research-team",
+    )
+
+    restored = restore_checkpoint(
+        path=checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        training_config=training_config,
+    )
+
+    assert restored.path == checkpoint_path
+    assert restored.step == 0
+    assert restored.wandb_run_id == "wandb-run-123"
+    assert restored.wandb_project == "llm-from-scratch"
+    assert restored.wandb_entity == "research-team"
+
+
+def test_checkpoint_retention_keeps_only_the_newest_files(tmp_path: Path) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=4)
+
+    for step in range(1, 5):
+        save_checkpoint(
+            path=tmp_path / f"step_{step:06d}.pt",
+            model=model,
+            optimizer=optimizer,
+            step=step,
+            training_config=training_config,
+            keep_last_n=2,
+        )
+
+    assert sorted(path.name for path in tmp_path.glob("step_*.pt")) == [
+        "step_000003.pt",
+        "step_000004.pt",
+    ]
+
+
+def test_latest_checkpoint_falls_back_when_the_newest_file_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=2)
+    save_checkpoint(
+        path=tmp_path / "step_000001.pt",
+        model=model,
+        optimizer=optimizer,
+        step=1,
+        training_config=training_config,
+        wandb_run_id="wandb-run-123",
+    )
+    (tmp_path / "step_000002.pt").write_bytes(b"not a torch checkpoint")
+
+    with pytest.warns(RuntimeWarning, match="Skipping unreadable checkpoint"):
+        restored = restore_latest_checkpoint(
+            directory=tmp_path,
+            model=model,
+            optimizer=optimizer,
+            training_config=training_config,
+        )
+
+    assert restored.path == tmp_path / "step_000001.pt"
+    assert restored.step == 1
+    assert restored.wandb_run_id == "wandb-run-123"
+
+
+def test_latest_checkpoint_falls_back_when_the_newest_config_is_incompatible(
+    tmp_path: Path,
+) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    requested_config = TrainingConfig(max_steps=2, grad_accum_steps=1)
+    save_checkpoint(
+        path=tmp_path / "step_000001.pt",
+        model=model,
+        optimizer=optimizer,
+        step=1,
+        training_config=requested_config,
+    )
+    save_checkpoint(
+        path=tmp_path / "step_000002.pt",
+        model=model,
+        optimizer=optimizer,
+        step=2,
+        training_config=TrainingConfig(max_steps=2, grad_accum_steps=2),
+    )
+
+    with pytest.warns(RuntimeWarning, match="Skipping unreadable checkpoint"):
+        restored = restore_latest_checkpoint(
+            directory=tmp_path,
+            model=model,
+            optimizer=optimizer,
+            training_config=requested_config,
+        )
+
+    assert restored.path == tmp_path / "step_000001.pt"
+    assert restored.step == 1
+
+
+def test_latest_checkpoint_falls_back_when_filename_step_disagrees_with_payload(
+    tmp_path: Path,
+) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=2)
+    save_checkpoint(
+        path=tmp_path / "step_000001.pt",
+        model=model,
+        optimizer=optimizer,
+        step=1,
+        training_config=training_config,
+    )
+    newest_path = save_checkpoint(
+        path=tmp_path / "step_000002.pt",
+        model=model,
+        optimizer=optimizer,
+        step=2,
+        training_config=training_config,
+    )
+    payload = torch.load(newest_path, weights_only=True)
+    payload["step"] = 1
+    torch.save(payload, newest_path)
+
+    with pytest.warns(RuntimeWarning, match="filename step"):
+        restored = restore_latest_checkpoint(
+            directory=tmp_path,
+            model=model,
+            optimizer=optimizer,
+            training_config=training_config,
+        )
+
+    assert restored.path == tmp_path / "step_000001.pt"
+    assert restored.step == 1
+
+
+def test_checkpoint_validates_the_training_run_configuration(tmp_path: Path) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=1)
+    saved_run_config = TrainingRunConfig(
+        manifest_sha256="a" * 64,
+        batch_size=2,
+        optimizer_name="AdamW",
+        optimizer_betas=(0.9, 0.95),
+        optimizer_weight_decay=0.1,
+        optimizer_eps=1e-8,
+    )
+    checkpoint_path = save_checkpoint(
+        path=tmp_path / "step_000000.pt",
+        model=model,
+        optimizer=optimizer,
+        step=0,
+        training_config=training_config,
+        run_config=saved_run_config,
+    )
+    different_run_config = TrainingRunConfig(
+        manifest_sha256="a" * 64,
+        batch_size=4,
+        optimizer_name="AdamW",
+        optimizer_betas=(0.9, 0.95),
+        optimizer_weight_decay=0.1,
+        optimizer_eps=1e-8,
+    )
+
+    with pytest.raises(ValueError, match="checkpoint run_config does not match"):
+        restore_checkpoint(
+            path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            training_config=training_config,
+            run_config=different_run_config,
+        )
+
+
+def test_checkpoint_v1_without_precision_loads_as_fp32(tmp_path: Path) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=1, precision="fp32")
+    checkpoint_path = save_checkpoint(
+        path=tmp_path / "step_000000.pt",
+        model=model,
+        optimizer=optimizer,
+        step=0,
+        training_config=training_config,
+    )
+    payload = torch.load(checkpoint_path, weights_only=True)
+    payload["format_version"] = 1
+    payload["training_config"].pop("precision")
+    payload.pop("wandb_run_id")
+    payload.pop("run_config")
+    torch.save(payload, checkpoint_path)
+
+    restored = restore_checkpoint(
+        path=checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        training_config=training_config,
+    )
+
+    assert restored.step == 0
+
+
+def test_checkpoint_v1_without_run_config_loads_with_an_explicit_warning(
+    tmp_path: Path,
+) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=1)
+    checkpoint_path = save_checkpoint(
+        path=tmp_path / "step_000000.pt",
+        model=model,
+        optimizer=optimizer,
+        step=0,
+        training_config=training_config,
+    )
+    payload = torch.load(checkpoint_path, weights_only=True)
+    payload["format_version"] = 1
+    payload["training_config"].pop("precision")
+    payload.pop("run_config")
+    torch.save(payload, checkpoint_path)
+    run_config = TrainingRunConfig(
+        manifest_sha256="a" * 64,
+        batch_size=2,
+        optimizer_name="AdamW",
+        optimizer_betas=(0.9, 0.95),
+        optimizer_weight_decay=0.1,
+        optimizer_eps=1e-8,
+    )
+
+    with pytest.warns(RuntimeWarning, match="cannot validate manifest, batch, or optimizer"):
+        restored = restore_checkpoint(
+            path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            training_config=training_config,
+            run_config=run_config,
+        )
+
+    assert restored.step == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("manifest_sha256", "not-a-digest", "manifest_sha256"),
+        ("batch_size", 0, "batch_size"),
+        ("optimizer_name", "", "optimizer_name"),
+        ("optimizer_betas", (0.9, 1.0), "optimizer_betas"),
+        ("optimizer_weight_decay", -0.1, "optimizer_weight_decay"),
+        ("optimizer_eps", 0.0, "optimizer_eps"),
+    ],
+)
+def test_training_run_config_rejects_invalid_values(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "manifest_sha256": "a" * 64,
+        "batch_size": 2,
+        "optimizer_name": "AdamW",
+        "optimizer_betas": (0.9, 0.95),
+        "optimizer_weight_decay": 0.1,
+        "optimizer_eps": 1e-8,
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        TrainingRunConfig(**values)  # type: ignore[arg-type]
+
+
+def test_checkpoint_rejects_a_non_integer_format_version(tmp_path: Path) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=1)
+    checkpoint_path = save_checkpoint(
+        path=tmp_path / "checkpoint.pt",
+        model=model,
+        optimizer=optimizer,
+        step=0,
+        training_config=training_config,
+    )
+    payload = torch.load(checkpoint_path, weights_only=True)
+    payload["format_version"] = []
+    torch.save(payload, checkpoint_path)
+
+    with pytest.raises(ValueError, match="format_version must be an integer"):
+        restore_checkpoint(
+            path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            training_config=training_config,
+        )
 
 
 def test_checkpoint_rejects_a_different_model_configuration(tmp_path: Path) -> None:

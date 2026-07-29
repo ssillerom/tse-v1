@@ -22,6 +22,69 @@ def _tiny_model(dropout: float = 0.0) -> GPT:
     )
 
 
+class AutocastRecordingGPT(GPT):
+    def __init__(self) -> None:
+        super().__init__(_tiny_model().config)
+        self.autocast_observations: list[bool] = []
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        self.autocast_observations.append(torch.is_autocast_enabled(input_ids.device.type))
+        return super().forward(input_ids, targets)
+
+
+def test_training_config_rejects_an_unknown_precision() -> None:
+    with pytest.raises(ValueError, match="precision must be one of"):
+        TrainingConfig(max_steps=1, precision="fp16")  # type: ignore[arg-type]
+
+
+def test_train_step_runs_the_forward_pass_under_bf16_autocast() -> None:
+    model = AutocastRecordingGPT()
+    optimizer = torch.optim.AdamW(model.parameters())
+    batch = (
+        torch.tensor([[0, 1, 2, 3, 4, 5]]),
+        torch.tensor([[1, 2, 3, 4, 5, 6]]),
+    )
+
+    loss, gradient_norm = train_step(
+        model=model,
+        optimizer=optimizer,
+        microbatches=[batch],
+        max_grad_norm=1.0,
+        device="cpu",
+        precision="bf16",
+    )
+
+    assert model.autocast_observations == [True]
+    assert math.isfinite(loss)
+    assert math.isfinite(gradient_norm)
+
+
+def test_train_step_rejects_bf16_before_using_an_unsupported_cuda_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    model = _tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters())
+    batch = (
+        torch.tensor([[0, 1, 2, 3, 4, 5]]),
+        torch.tensor([[1, 2, 3, 4, 5, 6]]),
+    )
+
+    with pytest.raises(ValueError, match="bf16 precision is not supported"):
+        train_step(
+            model=model,
+            optimizer=optimizer,
+            microbatches=[batch],
+            max_grad_norm=1.0,
+            device="cuda",
+            precision="bf16",
+        )
+
+
 @pytest.mark.parametrize(
     ("validation_loss", "validation_perplexity"),
     [
@@ -214,6 +277,24 @@ def test_evaluate_returns_loss_without_gradients_and_restores_training_mode() ->
     assert math.isfinite(validation_loss)
     assert model.training
     assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_evaluate_runs_the_forward_pass_under_bf16_autocast() -> None:
+    model = AutocastRecordingGPT()
+    batch = (
+        torch.tensor([[0, 1, 2, 3, 4, 5]]),
+        torch.tensor([[1, 2, 3, 4, 5, 6]]),
+    )
+
+    validation_loss = evaluate(
+        model=model,
+        batches=[batch],
+        device="cpu",
+        precision="bf16",
+    )
+
+    assert model.autocast_observations == [True]
+    assert math.isfinite(validation_loss)
 
 
 def test_evaluate_skips_batches_without_target_tokens() -> None:
