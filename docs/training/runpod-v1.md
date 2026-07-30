@@ -87,6 +87,10 @@ source. The preparation code also refuses to overwrite existing published shards
 completed source really must be replaced, remove only that source directory after checking
 its exact path, then rerun its individual target.
 
+`make validate-recipe` verifies every manifest v3 SHA-256. Run it after preparation and again
+after transferring or restoring the network volume; the sequential reads are intentional and
+should happen before renting the final H100.
+
 Before terminating the CPU Pod, verify that the six manifests exist and preserve the network
 volume:
 

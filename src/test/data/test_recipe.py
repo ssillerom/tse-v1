@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -15,6 +16,10 @@ def _write_manifest(directory: Path, name: str, token_count: int = 128) -> Path:
     validation_path = source_directory / "validation.bin"
     np.arange(token_count, dtype=np.uint16).tofile(train_path)
     np.arange(32, dtype=np.uint16).tofile(validation_path)
+    with train_path.open("rb") as train_file:
+        train_sha256 = hashlib.file_digest(train_file, "sha256").hexdigest()
+    with validation_path.open("rb") as validation_file:
+        validation_sha256 = hashlib.file_digest(validation_file, "sha256").hexdigest()
     manifest_path = source_directory / "manifest.json"
     write_manifest(
         manifest_path,
@@ -29,8 +34,18 @@ def _write_manifest(directory: Path, name: str, token_count: int = 128) -> Path:
                 "validation": {"tokens": 32, "shards": 1},
             },
             "shards": [
-                {"file": train_path.name, "split": "train", "tokens": token_count},
-                {"file": validation_path.name, "split": "validation", "tokens": 32},
+                {
+                    "file": train_path.name,
+                    "split": "train",
+                    "tokens": token_count,
+                    "sha256": train_sha256,
+                },
+                {
+                    "file": validation_path.name,
+                    "split": "validation",
+                    "tokens": 32,
+                    "sha256": validation_sha256,
+                },
             ],
         },
     )

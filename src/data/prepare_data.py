@@ -58,6 +58,7 @@ class ShardMetadata:
 
     file: str
     tokens: int
+    sha256: str
 
 
 class TokenShardWriter:
@@ -137,7 +138,15 @@ class TokenShardWriter:
         finally:
             temporary_path.unlink(missing_ok=True)
 
-        self.shards.append(ShardMetadata(file=shard_path.name, tokens=token_count))
+        with shard_path.open("rb") as shard_file:
+            sha256 = hashlib.file_digest(shard_file, "sha256").hexdigest()
+        self.shards.append(
+            ShardMetadata(
+                file=shard_path.name,
+                tokens=token_count,
+                sha256=sha256,
+            )
+        )
         LOGGER.info(
             "Saved shard %04d | %12s tokens | %14s total | %s",
             self.shard_idx,
@@ -448,12 +457,16 @@ def _prepare_into_staging_directory(
         )
         writer = writers[output_split]
         remaining_tokens = num_tokens - total_tokens
-        tokens_added = writer.add_tokens(tokens[:remaining_tokens])
+        document_truncated = len(tokens) > remaining_tokens
+        tokens_to_write = tokens if not document_truncated else tokens[:remaining_tokens]
+        if document_truncated:
+            tokens_to_write[-1] = encoding.eot_token
+        tokens_added = writer.add_tokens(tokens_to_write)
         total_tokens += tokens_added
         if tokens_added > 0:
             docs_used += 1
             split_counts[output_split]["docs_used"] += 1
-        if tokens_added < len(tokens):
+        if document_truncated:
             docs_truncated += 1
             split_counts[output_split]["docs_truncated"] += 1
 
@@ -486,6 +499,7 @@ def _prepare_into_staging_directory(
                 "file": str(relative_directory / shard.file),
                 "split": split_name,
                 "tokens": shard.tokens,
+                "sha256": shard.sha256,
             }
             for shard in writer.shards
         )

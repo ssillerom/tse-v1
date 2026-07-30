@@ -13,7 +13,7 @@ El pipeline de datos ya permite:
 - tokenizar documentos con una codificación de `tiktoken` compatible con `uint16`;
 - limitar una preparación por documentos y tokens;
 - separar train y validation mediante un hash de contenido reproducible;
-- validar y publicar shards y manifest de forma transaccional;
+- validar y publicar shards y manifest de forma transaccional, con SHA-256 por shard;
 - cargar shards mediante `numpy.memmap`;
 - producir pares `(input_ids, targets)` para causal language modeling;
 - inspeccionar las ventanas como IDs y texto decodificado.
@@ -70,7 +70,14 @@ data/fineweb-edu-50/
 ```
 
 `--validation-ratio` es determinista pero aproximado: con 50 documentos no garantiza
-exactamente 45/5. Los duplicados exactos se asignan siempre al mismo split.
+exactamente 45/5. Los duplicados exactos se asignan siempre al mismo split. Cada documento
+termina en EOT incluso cuando `--num-tokens` obliga a truncarlo: el último token de contenido
+aceptado se sustituye por EOT.
+
+La preparación nueva publica manifest v3. Cada entrada de `shards` incluye el SHA-256 del
+fichero y `load_manifest()` lo verifica además del tamaño antes de abrir los datos. Los
+manifest v2 existentes siguen siendo legibles, pero no ofrecen esta comprobación porque
+nunca almacenaron checksums.
 
 ## Inspeccionar el slicing
 
@@ -197,7 +204,7 @@ documentos pequeños y escriben shards reales en directorios temporales.
 ## Limitaciones actuales
 
 - Solo se admiten tokenizadores de `tiktoken` cuyos IDs quepan en `uint16`.
-- Los shards no incluyen todavía checksums ni reanudación de una preparación interrumpida.
+- La preparación todavía no puede reanudarse a mitad de un dataset.
 - La tokenización es de un solo proceso.
 - Las secuencias no cruzan fronteras de shard; la cola incompleta de cada shard se descarta.
 - El entrenamiento actual es de un solo dispositivo; CUDA usa BF16 con

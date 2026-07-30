@@ -49,7 +49,8 @@ is not a reproducible revision.
 FineWeb-Edu is prepared to the 10B sample cap and assigns 1% to validation, leaving expected
 headroom above its 9.800000512B-token training quota. The other sources prepare slightly more
 than their quotas and assign 2% to validation. The commands below create 100M-token shards
-and use the same GPT-2 encoding:
+and use the same GPT-2 encoding. New preparations publish manifest v3 with a SHA-256 for every
+shard; recipe validation rejects corruption before a paid training run.
 
 ```bash
 uv run prepare-data prepare \

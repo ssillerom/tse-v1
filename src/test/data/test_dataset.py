@@ -1,3 +1,4 @@
+import hashlib
 import json
 from collections.abc import Sequence
 from pathlib import Path
@@ -8,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from data.dataset import PretrainingDataset
+from data.manifest import FORMAT_VERSION
 
 ShardSpec = tuple[str, str, Sequence[int]]
 
@@ -22,11 +24,14 @@ def _write_prepared_dataset(root: Path, shards: Sequence[ShardSpec]) -> Path:
         shard_path.parent.mkdir(parents=True, exist_ok=True)
         tokens = np.asarray(token_values, dtype=np.uint16)
         tokens.tofile(shard_path)
+        with shard_path.open("rb") as shard_file:
+            sha256 = hashlib.file_digest(shard_file, "sha256").hexdigest()
         entries.append(
             {
                 "file": relative_name,
                 "split": split,
                 "tokens": int(tokens.size),
+                "sha256": sha256,
             }
         )
         counts = split_counts.setdefault(split, {"shards": 0, "tokens": 0})
@@ -34,7 +39,7 @@ def _write_prepared_dataset(root: Path, shards: Sequence[ShardSpec]) -> Path:
         counts["tokens"] += int(tokens.size)
 
     manifest = {
-        "format_version": 2,
+        "format_version": FORMAT_VERSION,
         "storage": {"dtype": "uint16", "shard_size": 100},
         "splits": split_counts,
         "shards": entries,

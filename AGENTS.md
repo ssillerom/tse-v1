@@ -11,7 +11,7 @@ The repository has a tested, single-device training slice:
 
 ```text
 Hugging Face document stream
-  -> token shards + manifest v2
+  -> token shards + manifest v3
   -> memory-mapped fixed-length sequences
   -> PyTorch DataLoader batches
   -> V1 GPT loss
@@ -25,7 +25,7 @@ training system.
 ## Repository map
 
 - `src/data/prepare_data.py`: streaming preparation, tokenization, partitioning, atomic publish.
-- `src/data/manifest.py`: manifest v2 serialization, validation, and shard confinement.
+- `src/data/manifest.py`: manifest v3 serialization, checksum validation, and shard confinement.
 - `src/data/dataset.py`: memory-mapped causal sequences and global indexing.
 - `src/model/`: V1 decoder-only Transformer components and assembled GPT.
 - `src/training/trainer.py`: scheduled training, token-weighted accumulation, and evaluation.
@@ -42,10 +42,13 @@ training system.
 ## Data invariants
 
 - A prepared dataset is complete only when `manifest.json` exists.
-- Manifest format version 2 is the current reader/writer contract.
-- Every document ends with the tokenizer's EOT token.
+- Manifest format version 3 is the current writer contract; legacy v2 remains readable.
+- Every document, including one truncated by the token budget, ends with the tokenizer's EOT
+  token.
 - Token IDs must fit the manifest storage dtype; the current dtype is `uint16`.
 - Shard paths are relative to and confined within the manifest directory.
+- Every v3 shard entry declares the SHA-256 of the exact published bytes, and readers reject a
+  mismatch.
 - Train/validation assignment is deterministic for the same text and split seed.
 - A training sample reads `seq_len + 1` tokens and returns two shifted `torch.long` tensors.
 - Samples never cross shard boundaries.

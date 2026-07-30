@@ -191,7 +191,7 @@ def test_prepare_writes_a_reproducible_manifest(
 
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert manifest == {
-        "format_version": 2,
+        "format_version": 3,
         "dataset": {
             "path": "example/dataset",
             "name": None,
@@ -224,9 +224,69 @@ def test_prepare_writes_a_reproducible_manifest(
                 "tokens": 2,
             }
         },
-        "shards": [{"file": "shard_0000.bin", "split": "train", "tokens": 2}],
+        "shards": [
+            {
+                "file": "shard_0000.bin",
+                "split": "train",
+                "tokens": 2,
+                "sha256": ("5f09890debc87bf62c6d1f028001dedbf7fc72a503c942ef11c93a3ebeb45d28"),
+            }
+        ],
     }
     assert received_arguments["revision"] == "fixed-revision"
+
+
+def test_prepare_preserves_eot_when_the_token_budget_truncates_a_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_load_dataset(**kwargs: object) -> list[dict[str, str]]:
+        del kwargs
+        return [{"text": "hello world"}]
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+
+    manifest = prepare_streaming_dataset(
+        output_dir=tmp_path,
+        dataset_name="example/dataset",
+        text_field="text",
+        num_tokens=2,
+        shard_size=10,
+    )
+
+    token_ids = np.fromfile(tmp_path / "shard_0000.bin", dtype=np.uint16).tolist()
+    assert token_ids == [31_373, 50_256]
+    assert manifest["counts"]["docs_truncated"] == 1
+    assert manifest["splits"]["train"]["docs_truncated"] == 1
+
+
+def test_prepare_records_the_known_sha256_of_each_published_shard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_load_dataset(**kwargs: object) -> list[dict[str, str]]:
+        del kwargs
+        return [{"text": "hello"}]
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+
+    manifest = prepare_streaming_dataset(
+        output_dir=tmp_path,
+        dataset_name="example/dataset",
+        text_field="text",
+        num_tokens=10,
+        shard_size=10,
+    )
+
+    assert manifest["format_version"] == 3
+    assert manifest["shards"] == [
+        {
+            "file": "shard_0000.bin",
+            "split": "train",
+            "tokens": 2,
+            "sha256": "5f09890debc87bf62c6d1f028001dedbf7fc72a503c942ef11c93a3ebeb45d28",
+        }
+    ]
 
 
 def test_prepare_can_flatten_and_filter_nested_source_records(
@@ -402,7 +462,14 @@ def test_prepare_preserves_the_source_split_without_partitioning(
         split="validation",
     )
 
-    assert manifest["shards"] == [{"file": "shard_0000.bin", "split": "validation", "tokens": 2}]
+    assert manifest["shards"] == [
+        {
+            "file": "shard_0000.bin",
+            "split": "validation",
+            "tokens": 2,
+            "sha256": "5f09890debc87bf62c6d1f028001dedbf7fc72a503c942ef11c93a3ebeb45d28",
+        }
+    ]
     assert manifest["splits"] == {
         "validation": {
             "docs_truncated": 0,

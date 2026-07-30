@@ -1,7 +1,9 @@
 """Read, validate, and atomically write prepared-data manifests."""
 
+import hashlib
 import json
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,8 +11,11 @@ from typing import Any
 
 import numpy as np
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
+LEGACY_FORMAT_VERSION = 2
+SUPPORTED_FORMAT_VERSIONS = frozenset({LEGACY_FORMAT_VERSION, FORMAT_VERSION})
 STORAGE_DTYPE = "uint16"
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True)
@@ -20,6 +25,7 @@ class ManifestShard:
     path: Path
     split: str
     token_count: int
+    sha256: str | None
 
 
 @dataclass(frozen=True)
@@ -52,7 +58,7 @@ class DataManifest:
 
 
 def load_manifest(path: str | Path) -> DataManifest:
-    """Load a manifest and validate its schema and referenced shard files."""
+    """Load a manifest and validate its schema, files, and checksums by default."""
     manifest_path = Path(path)
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
@@ -71,7 +77,10 @@ def load_manifest(path: str | Path) -> DataManifest:
 def write_manifest(path: str | Path, payload: Mapping[str, object]) -> None:
     """Validate and atomically write a prepared-data manifest."""
     manifest_path = Path(path)
-    _validate_manifest(dict(payload), manifest_path)
+    normalized_payload = dict(payload)
+    if normalized_payload.get("format_version") != FORMAT_VERSION:
+        raise ValueError(f"Writer requires manifest format_version {FORMAT_VERSION}")
+    _validate_manifest(normalized_payload, manifest_path)
 
     temporary_path = manifest_path.with_suffix(".json.tmp")
     try:
@@ -84,9 +93,12 @@ def write_manifest(path: str | Path, payload: Mapping[str, object]) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def _validate_manifest(payload: dict[str, Any], manifest_path: Path) -> DataManifest:
+def _validate_manifest(
+    payload: dict[str, Any],
+    manifest_path: Path,
+) -> DataManifest:
     format_version = payload.get("format_version")
-    if format_version != FORMAT_VERSION:
+    if format_version not in SUPPORTED_FORMAT_VERSIONS:
         raise ValueError(f"Unsupported manifest format_version: {format_version}")
 
     storage = payload.get("storage")
@@ -115,6 +127,7 @@ def _validate_manifest(payload: dict[str, Any], manifest_path: Path) -> DataMani
             position=position,
             manifest_directory=manifest_path.parent,
             available_splits=available_splits,
+            checksum_required=format_version == FORMAT_VERSION,
         )
         for position, entry in enumerate(raw_shards)
     )
@@ -153,6 +166,7 @@ def _validate_shard(
     position: int,
     manifest_directory: Path,
     available_splits: frozenset[str],
+    checksum_required: bool,
 ) -> ManifestShard:
     if not isinstance(entry, dict):
         raise ValueError(f"Shard entry at position {position} is not an object")
@@ -188,4 +202,23 @@ def _validate_shard(
             f"and should contain {expected_bytes} bytes, but contains {actual_bytes} bytes"
         )
 
-    return ManifestShard(path=shard_path, split=split, token_count=token_count)
+    raw_sha256 = entry.get("sha256")
+    if raw_sha256 is None and not checksum_required:
+        sha256 = None
+    elif not isinstance(raw_sha256, str) or SHA256_PATTERN.fullmatch(raw_sha256) is None:
+        raise ValueError(f"Shard {shard_path} must declare a lowercase SHA-256 checksum")
+    else:
+        sha256 = raw_sha256
+        with shard_path.open("rb") as shard_file:
+            actual_sha256 = hashlib.file_digest(shard_file, "sha256").hexdigest()
+        if actual_sha256 != sha256:
+            raise ValueError(
+                f"Shard {shard_path} SHA-256 mismatch: expected {sha256}, got {actual_sha256}"
+            )
+
+    return ManifestShard(
+        path=shard_path,
+        split=split,
+        token_count=token_count,
+        sha256=sha256,
+    )

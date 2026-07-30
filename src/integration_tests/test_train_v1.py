@@ -24,6 +24,10 @@ def _write_training_manifest(directory: Path) -> Path:
     validation_path = directory / "validation.bin"
     train_tokens.tofile(train_path)
     validation_tokens.tofile(validation_path)
+    with train_path.open("rb") as train_file:
+        train_sha256 = hashlib.file_digest(train_file, "sha256").hexdigest()
+    with validation_path.open("rb") as validation_file:
+        validation_sha256 = hashlib.file_digest(validation_file, "sha256").hexdigest()
     manifest_path = directory / "manifest.json"
     write_manifest(
         manifest_path,
@@ -38,11 +42,17 @@ def _write_training_manifest(directory: Path) -> Path:
                 "validation": {"tokens": 20, "shards": 1},
             },
             "shards": [
-                {"file": train_path.name, "split": "train", "tokens": 40},
+                {
+                    "file": train_path.name,
+                    "split": "train",
+                    "tokens": 40,
+                    "sha256": train_sha256,
+                },
                 {
                     "file": validation_path.name,
                     "split": "validation",
                     "tokens": 20,
+                    "sha256": validation_sha256,
                 },
             ],
         },
