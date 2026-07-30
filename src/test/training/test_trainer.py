@@ -6,7 +6,14 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from model.config import ModelConfig
 from model.gpt import GPT
-from training.trainer import StepMetrics, TrainingConfig, evaluate, train, train_step
+from training.trainer import (
+    StepMetrics,
+    TrainingConfig,
+    evaluate,
+    evaluate_domains,
+    train,
+    train_step,
+)
 
 
 def _tiny_model(dropout: float = 0.0) -> GPT:
@@ -34,6 +41,27 @@ class AutocastRecordingGPT(GPT):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self.autocast_observations.append(torch.is_autocast_enabled(input_ids.device.type))
         return super().forward(input_ids, targets)
+
+
+class FixedLossGPT(GPT):
+    """Expose deterministic domain losses through the public model interface."""
+
+    def __init__(self) -> None:
+        super().__init__(_tiny_model().config)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        logits = torch.zeros(
+            input_ids.size(0),
+            input_ids.size(1),
+            self.config.vocab_size,
+            device=input_ids.device,
+        )
+        loss = input_ids[0, 0].to(torch.float32)
+        return logits, loss if targets is not None else None
 
 
 def test_training_config_rejects_an_unknown_precision() -> None:
@@ -346,6 +374,50 @@ def test_evaluate_skips_batches_without_target_tokens() -> None:
     assert mixed_loss == pytest.approx(valid_only_loss)
 
 
+def test_evaluate_domains_reports_each_domain_and_recipe_weighted_aggregate() -> None:
+    model = FixedLossGPT()
+    validation = evaluate_domains(
+        model=model,
+        batches_by_domain={
+            "web": [
+                (
+                    torch.tensor([[1, 0]]),
+                    torch.tensor([[0, 1]]),
+                )
+            ],
+            "math": [
+                (
+                    torch.tensor([[3, 0]]),
+                    torch.tensor([[0, -100]]),
+                )
+            ],
+        },
+        domain_weights={"web": 0.75, "math": 0.25},
+        device="cpu",
+    )
+
+    assert validation.loss == pytest.approx(1.5)
+    assert validation.perplexity == pytest.approx(math.exp(1.5))
+    assert validation.target_tokens == 3
+    assert validation.domains["web"].loss == pytest.approx(1.0)
+    assert validation.domains["web"].target_tokens == 2
+    assert validation.domains["math"].loss == pytest.approx(3.0)
+    assert validation.domains["math"].target_tokens == 1
+
+
+def test_evaluate_domains_requires_one_weight_for_every_domain() -> None:
+    model = FixedLossGPT()
+    batch = [(torch.tensor([[1, 0]]), torch.tensor([[0, 1]]))]
+
+    with pytest.raises(ValueError, match="must match validation domains"):
+        evaluate_domains(
+            model=model,
+            batches_by_domain={"web": batch, "math": batch},
+            domain_weights={"web": 1.0},
+            device="cpu",
+        )
+
+
 def test_train_runs_accumulated_steps_with_scheduling_and_evaluation() -> None:
     torch.manual_seed(42)
     model = _tiny_model()
@@ -414,6 +486,32 @@ def test_train_runs_accumulated_steps_with_scheduling_and_evaluation() -> None:
     assert all(metrics.step_time_seconds > 0.0 for metrics in history)
     assert all(metrics.tokens_per_second > 0.0 for metrics in history)
     assert not torch.equal(model.token_embedding.weight, embedding_before)
+
+
+def test_train_reports_scheduled_validation_for_every_recipe_domain() -> None:
+    torch.manual_seed(42)
+    model = _tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    batch = (
+        torch.tensor([[0, 1, 2, 3, 4, 5]]),
+        torch.tensor([[1, 2, 3, 4, 5, 6]]),
+    )
+
+    history = train(
+        model=model,
+        optimizer=optimizer,
+        train_batches=[batch],
+        config=TrainingConfig(max_steps=1, eval_interval=1, eval_batches=1),
+        device="cpu",
+        validation_batches={"web": [batch], "math": [batch]},
+        validation_weights={"web": 0.8, "math": 0.2},
+    )
+
+    assert history[0].validation_loss is not None
+    assert history[0].validation_domains is not None
+    assert set(history[0].validation_domains) == {"web", "math"}
+    assert history[0].validation_domains["web"].target_tokens == 6
+    assert history[0].validation_domains["math"].target_tokens == 6
 
 
 def test_train_can_resume_from_an_already_positioned_batch_source() -> None:

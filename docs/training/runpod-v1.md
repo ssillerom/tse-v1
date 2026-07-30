@@ -191,6 +191,10 @@ tmux new -s v1-12b
 make h100-train MAX_LEARNING_RATE=0.0006
 ```
 
+If the eager/compiled rehearsal documented in `v1-english-12b.md` selected compilation, add
+`TORCH_COMPILE_ARGS="--compile --compile-mode default"` to both `h100-train` and every
+`h100-resume` invocation. Do not enable or disable compilation in the middle of a run.
+
 The command derives 22,888 complete optimizer steps from the recipe and begins WSD decay at
 step 20,599. Watch the first 100 steps in W&B and verify the first checkpoint at step 1,000.
 To prove recovery, stop the process cleanly after that checkpoint and run:
@@ -215,6 +219,10 @@ make h100-train \
 When the run finishes, copy the final checkpoint to durable object storage before terminating
 the Pod. A RunPod network volume is persistent independently of a Pod, but it is not a
 substitute for a long-term backup.
+
+Then install the optional evaluation extra and run the protocol in
+[`evaluation.md`](evaluation.md). Benchmark results are small JSON artifacts; preserve them
+beside the checkpoint and record their checkpoint SHA-256.
 
 ## Commands at a glance
 

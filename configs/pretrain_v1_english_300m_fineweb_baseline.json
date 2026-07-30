@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "name": "v1-english-300m-fineweb-baseline",
+  "sources": [
+    {
+      "name": "fineweb_edu_sample_10bt",
+      "manifest": "../data/pretrain-v1/fineweb-edu-sample-10bt/manifest.json"
+    }
+  ],
+  "phases": [
+    {
+      "name": "stable",
+      "tokens": 299892736,
+      "source_tokens": {
+        "fineweb_edu_sample_10bt": 299892736
+      }
+    }
+  ]
+}

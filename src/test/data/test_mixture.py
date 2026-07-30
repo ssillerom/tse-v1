@@ -84,6 +84,21 @@ def test_mixture_sampler_follows_each_phase_source_ratio() -> None:
     assert Counter(source_names[24:]) == {"general": 4, "code": 4}
 
 
+def test_mixture_sampler_reports_exact_source_counts_for_a_consumed_range() -> None:
+    mixture = _mixture()
+    sampler = DeterministicMixtureSampler(
+        dataset=mixture,
+        phases=_phases(),
+        seq_len=1,
+        seed=7,
+        block_size=4,
+    )
+    order = list(sampler)
+    expected = Counter(mixture.source_for_global_index(index) for index in order[5:29])
+
+    assert sampler.source_sequence_counts(5, 29) == dict(expected)
+
+
 def test_mixture_sampler_rejects_a_recipe_larger_than_prepared_sources() -> None:
     mixture = MixtureDataset(
         {

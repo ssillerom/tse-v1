@@ -16,7 +16,7 @@ from .evaluation import (
     EvaluationPrompt,
     generate_prompt_samples,
 )
-from .trainer import StepMetrics
+from .trainer import DomainEvaluation, StepMetrics
 
 
 class WandbRun(Protocol):
@@ -36,6 +36,23 @@ class WandbRun(Protocol):
     ) -> object: ...
 
 
+def domain_evaluation_to_wandb(
+    evaluation: DomainEvaluation,
+    step: int,
+) -> dict[str, float | int]:
+    """Map one aggregate and its domains to the stable validation schema."""
+    payload: dict[str, float | int] = {
+        "trainer/global_step": step,
+        "validation/loss": evaluation.loss,
+        "validation/perplexity": evaluation.perplexity,
+    }
+    for domain, domain_metrics in evaluation.domains.items():
+        payload[f"validation/{domain}/loss"] = domain_metrics.loss
+        payload[f"validation/{domain}/perplexity"] = domain_metrics.perplexity
+        payload[f"validation/{domain}/target_tokens"] = domain_metrics.target_tokens
+    return payload
+
+
 def metrics_to_wandb(metrics: StepMetrics) -> dict[str, float | int]:
     """Map one optimizer step to stable W&B metric names."""
     payload: dict[str, float | int] = {
@@ -53,6 +70,24 @@ def metrics_to_wandb(metrics: StepMetrics) -> dict[str, float | int]:
             raise ValueError("validation_perplexity is required when validation_loss is present")
         payload["validation/loss"] = metrics.validation_loss
         payload["validation/perplexity"] = metrics.validation_perplexity
+        if metrics.validation_domains is not None:
+            payload.update(
+                domain_evaluation_to_wandb(
+                    DomainEvaluation(
+                        loss=metrics.validation_loss,
+                        perplexity=metrics.validation_perplexity,
+                        target_tokens=sum(
+                            domain_metrics.target_tokens
+                            for domain_metrics in metrics.validation_domains.values()
+                        ),
+                        domains=metrics.validation_domains,
+                    ),
+                    metrics.step,
+                )
+            )
+    if metrics.source_tokens_seen is not None:
+        for source, token_count in metrics.source_tokens_seen.items():
+            payload[f"trainer/source_tokens_seen/{source}"] = token_count
     return payload
 
 
@@ -91,6 +126,10 @@ class WandbEvaluationLogger:
         self.run.define_metric("train/*", step_metric="trainer/global_step")
         self.run.define_metric("optimizer/*", step_metric="trainer/global_step")
         self.run.define_metric("trainer/tokens_*", step_metric="trainer/global_step")
+        self.run.define_metric(
+            "trainer/source_tokens_seen/*",
+            step_metric="trainer/global_step",
+        )
         self.run.define_metric("performance/*", step_metric="trainer/global_step")
         self.run.define_metric(
             "validation/loss",
@@ -101,6 +140,20 @@ class WandbEvaluationLogger:
             "validation/perplexity",
             step_metric="trainer/global_step",
             summary="min",
+        )
+        self.run.define_metric(
+            "validation/*/loss",
+            step_metric="trainer/global_step",
+            summary="min",
+        )
+        self.run.define_metric(
+            "validation/*/perplexity",
+            step_metric="trainer/global_step",
+            summary="min",
+        )
+        self.run.define_metric(
+            "validation/*/target_tokens",
+            step_metric="trainer/global_step",
         )
         self.run.define_metric(
             "samples/fixed_prompts",

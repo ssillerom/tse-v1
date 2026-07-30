@@ -10,6 +10,7 @@ WANDB_ENTITY ?=
 WANDB_MODE ?= online
 NUM_WORKERS ?= 4
 MAX_LEARNING_RATE ?= 0.0006
+TORCH_COMPILE_ARGS ?=
 A100_BATCH_SIZE ?= 8
 A100_GRAD_ACCUM_STEPS ?= 64
 A100_RUN_NAME ?= v1-a100-rehearsal
@@ -45,7 +46,8 @@ MODEL_ARGS := \
 	--d-model 1024 \
 	--n-layers 24 \
 	--n-heads 16 \
-	--seq-len 1024
+	--seq-len 1024 \
+	$(TORCH_COMPILE_ARGS)
 
 RUNTIME_ARGS := \
 	--recipe $(RECIPE) \

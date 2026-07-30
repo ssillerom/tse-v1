@@ -4,6 +4,7 @@ import math
 import os
 import re
 import warnings
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from numbers import Real
 from pathlib import Path
@@ -16,8 +17,8 @@ from src.model.gpt import GPT
 from .rng import TorchRngSnapshot, capture_torch_rng_state, restore_torch_rng_state
 from .trainer import TrainingConfig
 
-CHECKPOINT_FORMAT_VERSION = 4
-SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = frozenset({1, 2, 3, CHECKPOINT_FORMAT_VERSION})
+CHECKPOINT_FORMAT_VERSION = 5
+SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = frozenset({1, 2, 3, 4, CHECKPOINT_FORMAT_VERSION})
 CHECKPOINT_FILENAME_PATTERN = re.compile(r"step_(\d+)\.pt\Z")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -33,6 +34,7 @@ class RestoredCheckpoint:
     wandb_entity: str | None
     data_position: int
     tokens_seen: int
+    source_tokens_seen: dict[str, int] | None
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,8 @@ class TrainingRunConfig:
     optimizer_betas: tuple[float, float]
     optimizer_weight_decay: float
     optimizer_eps: float
+    compile_mode: str | None = None
+    source_token_budgets: tuple[tuple[str, int], ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.data_contract_sha256, str) or not SHA256_PATTERN.fullmatch(
@@ -88,6 +92,29 @@ class TrainingRunConfig:
             or self.optimizer_eps <= 0
         ):
             raise ValueError("optimizer_eps must be finite and positive")
+        if self.compile_mode not in (None, "default", "reduce-overhead", "max-autotune"):
+            raise ValueError(
+                "compile_mode must be one of None, 'default', 'reduce-overhead', or 'max-autotune'"
+            )
+        if self.source_token_budgets is not None:
+            if not isinstance(self.source_token_budgets, tuple) or not self.source_token_budgets:
+                raise ValueError("source_token_budgets must be a non-empty tuple or None")
+            source_names: set[str] = set()
+            for budget in self.source_token_budgets:
+                if not isinstance(budget, tuple) or len(budget) != 2:
+                    raise ValueError("source_token_budgets entries must be (name, tokens) tuples")
+                source_name, token_count = budget
+                if not isinstance(source_name, str) or not source_name:
+                    raise ValueError("source_token_budgets names must be non-empty strings")
+                if source_name in source_names:
+                    raise ValueError("source_token_budgets names must be unique")
+                source_names.add(source_name)
+                if (
+                    not isinstance(token_count, int)
+                    or isinstance(token_count, bool)
+                    or token_count <= 0
+                ):
+                    raise ValueError("source_token_budgets values must be positive integers")
 
 
 def _validate_optional_string(value: object, field_name: str) -> str | None:
@@ -96,6 +123,26 @@ def _validate_optional_string(value: object, field_name: str) -> str | None:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field_name} must be a non-empty string or None")
     return value
+
+
+def _validate_source_tokens_seen(
+    value: object,
+    tokens_seen: int,
+) -> dict[str, int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError("source_tokens_seen must be a non-empty mapping or None")
+    normalized: dict[str, int] = {}
+    for source_name, token_count in value.items():
+        if not isinstance(source_name, str) or not source_name:
+            raise ValueError("source_tokens_seen keys must be non-empty strings")
+        if not isinstance(token_count, int) or isinstance(token_count, bool) or token_count < 0:
+            raise ValueError("source_tokens_seen values must be non-negative integers")
+        normalized[source_name] = token_count
+    if sum(normalized.values()) != tokens_seen:
+        raise ValueError("source_tokens_seen values must sum to tokens_seen")
+    return normalized
 
 
 def save_checkpoint(
@@ -111,6 +158,7 @@ def save_checkpoint(
     run_config: TrainingRunConfig | None = None,
     data_position: int = 0,
     tokens_seen: int = 0,
+    source_tokens_seen: Mapping[str, int] | None = None,
 ) -> Path:
     """Atomically save the state required to resume training."""
     if not isinstance(step, int) or isinstance(step, bool) or step < 0:
@@ -131,6 +179,10 @@ def save_checkpoint(
         raise ValueError("data_position must be a non-negative integer")
     if not isinstance(tokens_seen, int) or isinstance(tokens_seen, bool) or tokens_seen < 0:
         raise ValueError("tokens_seen must be a non-negative integer")
+    normalized_source_tokens_seen = _validate_source_tokens_seen(
+        source_tokens_seen,
+        tokens_seen,
+    )
 
     checkpoint_path = Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -152,6 +204,7 @@ def save_checkpoint(
         "run_config": None if run_config is None else asdict(run_config),
         "data_position": data_position,
         "tokens_seen": tokens_seen,
+        "source_tokens_seen": normalized_source_tokens_seen,
     }
 
     try:
@@ -225,6 +278,7 @@ def restore_checkpoint(
     saved_run_config = payload.get("run_config")
     data_position = payload.get("data_position", 0)
     tokens_seen = payload.get("tokens_seen", 0)
+    source_tokens_seen = payload.get("source_tokens_seen")
     cuda_rng_states = payload.get("cuda_rng_states")
     mps_rng_state = payload.get("mps_rng_state")
     if not isinstance(model_state, dict):
@@ -259,6 +313,7 @@ def restore_checkpoint(
         raise ValueError("checkpoint contains an invalid data_position")
     if not isinstance(tokens_seen, int) or isinstance(tokens_seen, bool) or tokens_seen < 0:
         raise ValueError("checkpoint contains an invalid tokens_seen")
+    source_tokens_seen = _validate_source_tokens_seen(source_tokens_seen, tokens_seen)
     if model_config != asdict(model.config):
         raise ValueError("checkpoint model_config does not match the current model configuration")
     if saved_training_config != asdict(training_config):
@@ -285,6 +340,19 @@ def restore_checkpoint(
                     RuntimeWarning,
                     stacklevel=2,
                 )
+            if normalized_run_config is not None and format_version <= 4:
+                normalized_run_config.setdefault("compile_mode", None)
+            if normalized_run_config is not None and format_version <= 4:
+                normalized_run_config["source_token_budgets"] = expected_run_config[
+                    "source_token_budgets"
+                ]
+                if expected_run_config["source_token_budgets"] is not None:
+                    warnings.warn(
+                        "Legacy checkpoint has no source token budgets; the configured "
+                        "mixture cannot be validated independently of its data contract digest",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
             if normalized_run_config != expected_run_config:
                 raise ValueError(
                     "checkpoint run_config does not match the current run configuration"
@@ -313,6 +381,7 @@ def restore_checkpoint(
         wandb_entity=wandb_entity,
         data_position=data_position,
         tokens_seen=tokens_seen,
+        source_tokens_seen=source_tokens_seen,
     )
 
 

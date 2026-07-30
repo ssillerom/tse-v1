@@ -225,6 +225,37 @@ class DeterministicMixtureSampler(Sampler[int]):
                     yield self.dataset.global_index(source_name, local_index)
             phase_start = phase_end
 
+    def source_sequence_counts(
+        self,
+        start_position: int,
+        end_position: int,
+    ) -> dict[str, int]:
+        """Count exact source assignments in a half-open recipe position range."""
+        for name, value in (
+            ("start_position", start_position),
+            ("end_position", end_position),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer")
+        if not 0 <= start_position <= end_position <= self.total_sequences:
+            raise ValueError(
+                f"source count range must satisfy 0 <= start <= end <= {self.total_sequences}"
+            )
+
+        counts = {source_name: 0 for source_name in self.dataset.source_names}
+        phase_start = 0
+        for plan in self.phase_plans:
+            phase_end = phase_start + plan.sequence_count
+            overlap_start = max(start_position, phase_start)
+            overlap_end = min(end_position, phase_end)
+            for global_position in range(overlap_start, overlap_end):
+                source_name, _ = plan.assignment_at(global_position - phase_start)
+                counts[source_name] += 1
+            phase_start = phase_end
+            if phase_start >= end_position:
+                break
+        return counts
+
     def _build_prior_source_counts(self) -> tuple[dict[str, int], ...]:
         running_counts = {source_name: 0 for source_name in self.dataset.source_names}
         prior_counts: list[dict[str, int]] = []

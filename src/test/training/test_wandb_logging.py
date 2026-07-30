@@ -1,12 +1,14 @@
+import math
 from collections.abc import Mapping
 
+import pytest
 import tiktoken
 import torch
 
 from model.config import ModelConfig
 from model.gpt import GPT
 from training.evaluation import EvaluationPrompt
-from training.trainer import StepMetrics
+from training.trainer import EvaluationMetrics, StepMetrics
 from training.wandb_logging import WandbEvaluationLogger, metrics_to_wandb
 
 
@@ -56,6 +58,40 @@ def test_wandb_metrics_include_validation_only_on_evaluation_steps() -> None:
         "validation/loss": 7.2,
         "validation/perplexity": 1339.430764,
     }
+
+
+def test_wandb_metrics_include_each_validation_domain() -> None:
+    metrics = StepMetrics(
+        step=50,
+        loss=7.0,
+        gradient_norm=0.3,
+        learning_rate=3e-4,
+        tokens_in_step=8_192,
+        tokens_seen=409_600,
+        source_tokens_seen={"web": 327_680, "math": 81_920},
+        step_time_seconds=0.4,
+        tokens_per_second=20_480.0,
+        validation_loss=2.0,
+        validation_perplexity=math.exp(2.0),
+        validation_domains={
+            "web": EvaluationMetrics(loss=1.0, perplexity=math.e, target_tokens=1_024),
+            "math": EvaluationMetrics(
+                loss=5.0,
+                perplexity=math.exp(5.0),
+                target_tokens=512,
+            ),
+        },
+    )
+
+    payload = metrics_to_wandb(metrics)
+
+    assert payload["validation/web/loss"] == 1.0
+    assert payload["validation/web/perplexity"] == pytest.approx(math.e)
+    assert payload["validation/web/target_tokens"] == 1_024
+    assert payload["validation/math/loss"] == 5.0
+    assert payload["validation/math/target_tokens"] == 512
+    assert payload["trainer/source_tokens_seen/web"] == 327_680
+    assert payload["trainer/source_tokens_seen/math"] == 81_920
 
 
 class FakeRun:

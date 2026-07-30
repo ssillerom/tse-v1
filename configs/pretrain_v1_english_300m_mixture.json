@@ -1,0 +1,34 @@
+{
+  "format_version": 1,
+  "name": "v1-english-300m-mixture",
+  "sources": [
+    {
+      "name": "fineweb_edu_sample_10bt",
+      "manifest": "../data/pretrain-v1/fineweb-edu-sample-10bt/manifest.json"
+    },
+    {
+      "name": "stack_v3_python",
+      "manifest": "../data/pretrain-v1/stack-v3-python/manifest.json"
+    },
+    {
+      "name": "nemotron_math_3",
+      "manifest": "../data/pretrain-v1/nemotron-math-3/manifest.json"
+    },
+    {
+      "name": "finewiki_en",
+      "manifest": "../data/pretrain-v1/finewiki-en/manifest.json"
+    }
+  ],
+  "phases": [
+    {
+      "name": "stable",
+      "tokens": 299892736,
+      "source_tokens": {
+        "fineweb_edu_sample_10bt": 242968576,
+        "stack_v3_python": 20826112,
+        "nemotron_math_3": 11107328,
+        "finewiki_en": 24990720
+      }
+    }
+  ]
+}

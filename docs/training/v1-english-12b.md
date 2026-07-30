@@ -19,8 +19,8 @@ training system single-device and uses staged proofs before renting the final H1
   reaching zero on the final update.
 
 The recipe is [`configs/pretrain_v1_english_12b.json`](../../configs/pretrain_v1_english_12b.json).
-Its first source, the official FineWeb-Edu `sample-10BT`, also supplies the held-out validation
-sequences.
+Every declared source supplies a fixed held-out validation split. The trainer reports each
+source separately and a whole-recipe weighted aggregate.
 
 ## Data mix
 
@@ -223,6 +223,7 @@ The gate passes only if:
 
 - initial loss is close to `ln(50,304) = 10.83`;
 - training and validation loss trend down;
+- each source-specific validation loss remains finite and interpretable;
 - loss, gradient norm and LR stay finite;
 - gradient norm does not remain pinned at the clipping threshold;
 - throughput stabilizes after startup;
@@ -232,6 +233,34 @@ The gate passes only if:
 The command intentionally exits at step 250. Run it again after removing
 `--stop-after-step 250` and adding `--resume latest`; it must finish at step 500. Do not
 change model, optimizer, batch, schedule, recipe or seed.
+
+### Torch compilation A/B
+
+The architecture is a plausible `torch.compile` candidate: training shapes are fixed, the
+attention path uses SDPA, and RoPE avoids complex tensors. Compilation is nevertheless a
+hardware- and shape-specific optimization, not part of model correctness.
+
+Run two otherwise identical rehearsals in fresh checkpoint directories:
+
+```bash
+make a100-rehearsal-start \
+  A100_RUN_NAME=v1-a100-eager
+
+make a100-rehearsal-start \
+  A100_RUN_NAME=v1-a100-compile \
+  TORCH_COMPILE_ARGS="--compile --compile-mode default"
+```
+
+Ignore the compiled run's first steps when comparing throughput because they include JIT
+compilation. Compare stable `performance/tokens_per_second`, peak VRAM, validation curves,
+and failures or recompilations. Enable compilation for the final run only if it gives a
+material repeatable improvement (roughly 10% or more is a useful threshold) without changing
+the expected loss trajectory. Try `reduce-overhead` only after `default`; do not start with
+`max-autotune`, whose cold-start tuning cost can be large.
+
+Compilation mode is stored in the checkpoint run contract. A compiled run must be resumed
+with the identical `TORCH_COMPILE_ARGS`; eager and compiled checkpoints are intentionally not
+interchangeable continuations.
 
 ## Gate 3: learning-rate sweep
 
@@ -285,6 +314,10 @@ Watch the first 100 steps live before leaving the job unattended. At step 1,000,
 saved checkpoint on the same H100 with `--resume latest`; continuing the same run is preferable
 to starting over. If micro-batch 16 does not fit, use 8 × 64. This preserves the global batch,
 number of optimizer steps and schedule.
+
+After the final checkpoint, follow
+[`docs/training/evaluation.md`](evaluation.md) for the fixed benchmark suite and the
+300M-token FineWeb-only mixture baseline.
 
 John Enev used the same staged principle: cheap GPU for data preparation, an A100 smoke test
 of roughly 500 steps before each real run, and only then the H100. His published V1 smoke

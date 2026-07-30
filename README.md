@@ -24,7 +24,8 @@ causalidad, gradientes y que el modelo puede sobreajustar un batch dependiente d
 
 El módulo de entrenamiento añade grupos AdamW con weight decay selectivo, acumulación de
 gradientes ponderada por tokens, gradient clipping, warmup lineal con cosine decay o WSD,
-evaluación periódica y checkpoints atómicos que restauran modelo, optimizador, configuración,
+evaluación periódica por fuente y checkpoints atómicos que restauran modelo, optimizador,
+configuración,
 estado aleatorio y posición exacta en los datos. Una receta versionada puede mezclar varias
 fuentes y fases con un sampler determinista. El smoke test E2E recorre documentos locales,
 shards, mezcla de datos, entrenamiento, evaluación y reanudación sin depender de la red.
@@ -119,6 +120,11 @@ selecciona autocast BF16 cuando CUDA y la GPU lo soportan, y FP32 en los demás 
 y los estados de AdamW se mantienen en FP32; BF16 reduce el coste de las operaciones del
 forward y backward.
 
+Con una recipe multifuente, W&B registra loss, perplexity y tokens evaluados para cada fuente,
+además de un agregado ponderado con las proporciones completas de la recipe. `torch.compile`
+está disponible de forma opcional en CUDA mediante `--compile`; debe compararse contra eager
+en un rehearsal y conservarse idéntico al reanudar.
+
 Por defecto se conservan sólo los tres checkpoints con mayor step. Para continuar el mismo
 entrenamiento y la misma ejecución de W&B, usa el directorio y la configuración originales:
 
@@ -141,6 +147,9 @@ evaluación y las muestras realizadas al abrir el run preservan el RNG restaurad
 learning-rate schedule es una función del step y de la configuración guardada, no necesita un
 objeto de scheduler separado.
 
+En runs con receta, el checkpoint también conserva el presupuesto configurado y los tokens
+realmente consumidos por cada fuente; la trazabilidad de la mezcla no depende de W&B.
+
 Los checkpoints antiguos de formato v1 todavía se pueden abrir. Como no guardaban el hash del
 manifest, el batch size ni la configuración exacta del optimizador, la carga avisa de que no
 puede verificar esos datos antes de continuar.
@@ -161,6 +170,10 @@ La receta propuesta para el run completo, junto con los gates local, A100 y H100
 [V1 English 12B training run](docs/training/v1-english-12b.md). La ejecución reproducible en
 RunPod está detallada en [Running the V1 recipe on RunPod](docs/training/runpod-v1.md) y
 automatizada con `make help`.
+
+La evaluación post-hoc mediante LM Evaluation Harness, las métricas por dominio y el baseline
+FineWeb-only están descritos en [Evaluation protocol](docs/training/evaluation.md). El harness
+se instala como extra opcional con `uv sync --extra eval`.
 
 ## Desarrollo
 

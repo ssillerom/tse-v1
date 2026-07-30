@@ -76,6 +76,8 @@ def test_training_recipe_loads_relative_manifests_and_phase_quotas(tmp_path: Pat
     assert [source.name for source in recipe.sources] == ["general", "code"]
     assert [phase.name for phase in recipe.phases] == ["stable", "decay"]
     assert recipe.sources[0].manifest_path == first_manifest
+    assert recipe.source_token_totals == {"general": 88, "code": 40}
+    assert recipe.source_weights == {"general": 0.6875, "code": 0.3125}
 
 
 def test_training_recipe_rejects_a_phase_whose_source_tokens_do_not_sum(
@@ -102,6 +104,37 @@ def test_training_recipe_rejects_a_phase_whose_source_tokens_do_not_sum(
     )
 
     with pytest.raises(ValueError, match="source token quotas must sum to phase tokens"):
+        load_training_recipe(recipe_path)
+
+
+def test_training_recipe_rejects_a_declared_source_that_receives_no_tokens(
+    tmp_path: Path,
+) -> None:
+    general_manifest = _write_manifest(tmp_path, "general")
+    unused_manifest = _write_manifest(tmp_path, "unused")
+    recipe_path = tmp_path / "recipe.json"
+    recipe_path.write_text(
+        json.dumps(
+            {
+                "format_version": RECIPE_FORMAT_VERSION,
+                "name": "invalid",
+                "sources": [
+                    {"name": "general", "manifest": str(general_manifest)},
+                    {"name": "unused", "manifest": str(unused_manifest)},
+                ],
+                "phases": [
+                    {
+                        "name": "stable",
+                        "tokens": 100,
+                        "source_tokens": {"general": 100},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="declared sources receive no tokens: unused"):
         load_training_recipe(recipe_path)
 
 
@@ -133,3 +166,25 @@ def test_shipped_12b_recipe_has_exact_sequences_and_only_reuses_web_source() -> 
     )
     assert "fineweb_edu_dedup" not in sources_by_name
     assert "nemotron_knowledge" not in sources_by_name
+
+
+def test_shipped_300m_recipes_hold_compute_constant_and_change_only_the_mix() -> None:
+    repository_root = Path(__file__).parents[3]
+    mixture = json.loads(
+        (repository_root / "configs" / "pretrain_v1_english_300m_mixture.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    baseline = json.loads(
+        (repository_root / "configs" / "pretrain_v1_english_300m_fineweb_baseline.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert mixture["phases"][0]["tokens"] == 299_892_736
+    assert baseline["phases"][0]["tokens"] == 299_892_736
+    assert sum(mixture["phases"][0]["source_tokens"].values()) == 299_892_736
+    assert baseline["phases"][0]["source_tokens"] == {"fineweb_edu_sample_10bt": 299_892_736}
+    assert all(
+        token_count % 1_024 == 0 for token_count in mixture["phases"][0]["source_tokens"].values()
+    )

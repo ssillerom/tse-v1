@@ -2,7 +2,7 @@
 
 import math
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from numbers import Real
@@ -146,8 +146,10 @@ class StepMetrics:
     tokens_seen: int
     step_time_seconds: float
     tokens_per_second: float
+    source_tokens_seen: dict[str, int] | None = None
     validation_loss: float | None = None
     validation_perplexity: float | None = None
+    validation_domains: dict[str, "EvaluationMetrics"] | None = None
 
     def __post_init__(self) -> None:
         if (self.validation_loss is None) != (self.validation_perplexity is None):
@@ -155,19 +157,54 @@ class StepMetrics:
                 "validation_loss and validation_perplexity must either both be present "
                 "or both be absent"
             )
+        if self.validation_domains is not None and self.validation_loss is None:
+            raise ValueError("validation_domains require aggregate validation metrics")
+        if self.source_tokens_seen is not None:
+            if any(
+                not isinstance(source_name, str)
+                or not source_name
+                or not isinstance(token_count, int)
+                or isinstance(token_count, bool)
+                or token_count < 0
+                for source_name, token_count in self.source_tokens_seen.items()
+            ):
+                raise ValueError(
+                    "source_tokens_seen must map source names to non-negative integers"
+                )
+            if sum(self.source_tokens_seen.values()) != self.tokens_seen:
+                raise ValueError("source_tokens_seen must sum to tokens_seen")
 
 
 StepCallback = Callable[[StepMetrics], None]
 
 
-def evaluate(
+@dataclass(frozen=True)
+class EvaluationMetrics:
+    """Token-weighted metrics for one validation distribution."""
+
+    loss: float
+    perplexity: float
+    target_tokens: int
+
+
+@dataclass(frozen=True)
+class DomainEvaluation:
+    """Per-domain validation metrics plus a recipe-weighted aggregate."""
+
+    loss: float
+    perplexity: float
+    target_tokens: int
+    domains: dict[str, EvaluationMetrics]
+
+
+def evaluate_metrics(
     model: GPT,
     batches: Iterable[Batch],
     device: torch.device | str,
     max_batches: int | None = None,
     precision: Precision = "fp32",
-) -> float:
-    """Return token-weighted mean loss without changing the caller's model mode."""
+) -> EvaluationMetrics:
+    """Return token-weighted metrics without changing the caller's model mode."""
     _validate_precision_device(device, precision)
     if max_batches is not None and (
         not isinstance(max_batches, int) or isinstance(max_batches, bool) or max_batches <= 0
@@ -204,7 +241,77 @@ def evaluate(
 
     if total_targets == 0:
         raise ValueError("evaluation batches contain no target tokens")
-    return total_loss / total_targets
+    loss = total_loss / total_targets
+    return EvaluationMetrics(
+        loss=loss,
+        perplexity=perplexity_from_loss(loss),
+        target_tokens=total_targets,
+    )
+
+
+def evaluate(
+    model: GPT,
+    batches: Iterable[Batch],
+    device: torch.device | str,
+    max_batches: int | None = None,
+    precision: Precision = "fp32",
+) -> float:
+    """Return token-weighted mean loss without changing the caller's model mode."""
+    return evaluate_metrics(
+        model=model,
+        batches=batches,
+        device=device,
+        max_batches=max_batches,
+        precision=precision,
+    ).loss
+
+
+def evaluate_domains(
+    model: GPT,
+    batches_by_domain: Mapping[str, Iterable[Batch]],
+    domain_weights: Mapping[str, float],
+    device: torch.device | str,
+    max_batches: int | None = None,
+    precision: Precision = "fp32",
+) -> DomainEvaluation:
+    """Evaluate fixed domains and combine their losses using recipe weights."""
+    if not batches_by_domain:
+        raise ValueError("batches_by_domain must not be empty")
+    if set(domain_weights) != set(batches_by_domain):
+        raise ValueError("domain_weights keys must match validation domains")
+
+    total_weight = 0.0
+    for domain, weight in domain_weights.items():
+        if (
+            not isinstance(weight, Real)
+            or isinstance(weight, bool)
+            or not math.isfinite(float(weight))
+            or weight <= 0
+        ):
+            raise ValueError(
+                f"domain weight for {domain!r} must be finite and positive, got {weight!r}"
+            )
+        total_weight += float(weight)
+
+    domains = {
+        domain: evaluate_metrics(
+            model=model,
+            batches=batches,
+            device=device,
+            max_batches=max_batches,
+            precision=precision,
+        )
+        for domain, batches in batches_by_domain.items()
+    }
+    aggregate_loss = sum(
+        domains[domain].loss * float(domain_weights[domain]) / total_weight for domain in domains
+    )
+    return DomainEvaluation(
+        loss=aggregate_loss,
+        perplexity=perplexity_from_loss(aggregate_loss),
+        target_tokens=sum(metrics.target_tokens for metrics in domains.values()),
+        domains=domains,
+    )
 
 
 def _next_batch(
@@ -255,7 +362,8 @@ def train(
     train_batches: Iterable[Batch],
     config: TrainingConfig,
     device: torch.device | str,
-    validation_batches: Iterable[Batch] | None = None,
+    validation_batches: Iterable[Batch] | Mapping[str, Iterable[Batch]] | None = None,
+    validation_weights: Mapping[str, float] | None = None,
     start_step: int = 0,
     end_step: int | None = None,
     on_step: StepCallback | None = None,
@@ -304,8 +412,18 @@ def train(
         raise ValueError("validation_batches are required when eval_interval is configured")
     if isinstance(train_batches, Iterator):
         raise ValueError("train_batches must be reiterable, not a one-shot iterator")
-    if validation_batches is not None and isinstance(validation_batches, Iterator):
-        raise ValueError("validation_batches must be reiterable, not a one-shot iterator")
+    if isinstance(validation_batches, Mapping):
+        if not validation_batches:
+            raise ValueError("validation_batches must not be empty")
+        if validation_weights is None:
+            raise ValueError("validation_weights are required for domain validation")
+        if any(isinstance(batches, Iterator) for batches in validation_batches.values()):
+            raise ValueError("validation batches must be reiterable, not one-shot iterators")
+    else:
+        if validation_weights is not None:
+            raise ValueError("validation_weights require domain validation batches")
+        if validation_batches is not None and isinstance(validation_batches, Iterator):
+            raise ValueError("validation_batches must be reiterable, not a one-shot iterator")
 
     history: list[StepMetrics] = []
     if start_step == effective_end_step:
@@ -365,19 +483,35 @@ def train(
         completed_step = step_index + 1
         validation_loss = None
         validation_perplexity = None
+        validation_domains = None
         if (
             validation_batches is not None
             and config.eval_interval is not None
             and completed_step % config.eval_interval == 0
         ):
-            validation_loss = evaluate(
-                model=model,
-                batches=validation_batches,
-                device=device,
-                max_batches=config.eval_batches,
-                precision=config.precision,
-            )
-            validation_perplexity = perplexity_from_loss(validation_loss)
+            if isinstance(validation_batches, Mapping):
+                if validation_weights is None:
+                    raise RuntimeError("validated domain evaluation has no weights")
+                domain_evaluation = evaluate_domains(
+                    model=model,
+                    batches_by_domain=validation_batches,
+                    domain_weights=validation_weights,
+                    device=device,
+                    max_batches=config.eval_batches,
+                    precision=config.precision,
+                )
+                validation_loss = domain_evaluation.loss
+                validation_perplexity = domain_evaluation.perplexity
+                validation_domains = domain_evaluation.domains
+            else:
+                validation_loss = evaluate(
+                    model=model,
+                    batches=validation_batches,
+                    device=device,
+                    max_batches=config.eval_batches,
+                    precision=config.precision,
+                )
+                validation_perplexity = perplexity_from_loss(validation_loss)
 
         metrics = StepMetrics(
             step=completed_step,
@@ -390,6 +524,7 @@ def train(
             tokens_per_second=tokens_per_second,
             validation_loss=validation_loss,
             validation_perplexity=validation_perplexity,
+            validation_domains=validation_domains,
         )
         history.append(metrics)
         if on_step is not None:

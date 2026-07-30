@@ -45,6 +45,23 @@ class TrainingRecipe:
     def total_tokens(self) -> int:
         return sum(phase.target_tokens for phase in self.phases)
 
+    @cached_property
+    def source_token_totals(self) -> dict[str, int]:
+        """Return the exact token budget assigned to every source."""
+        totals = {source.name: 0 for source in self.sources}
+        for phase in self.phases:
+            for source_name, token_count in phase.source_tokens:
+                totals[source_name] += token_count
+        return totals
+
+    @cached_property
+    def source_weights(self) -> dict[str, float]:
+        """Return whole-recipe source proportions for aggregate validation."""
+        return {
+            source_name: token_count / self.total_tokens
+            for source_name, token_count in self.source_token_totals.items()
+        }
+
 
 def _required_non_empty_string(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value:
@@ -151,6 +168,14 @@ def load_training_recipe(path: str | Path) -> TrainingRecipe:
     sources = _parse_sources(payload.get("sources"), recipe_path)
     source_names = frozenset(source.name for source in sources)
     phases = _parse_phases(payload.get("phases"), source_names)
+    used_source_names = {
+        source_name for phase in phases for source_name, _token_count in phase.source_tokens
+    }
+    unused_source_names = sorted(source_names - used_source_names)
+    if unused_source_names:
+        raise ValueError(
+            "Recipe declared sources receive no tokens: " + ", ".join(unused_source_names)
+        )
 
     tokenizer: ManifestTokenizer | None = None
     for source in sources:

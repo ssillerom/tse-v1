@@ -144,6 +144,23 @@ def test_train_v1_runs_evaluation_generation_and_checkpointing_offline(
     assert checkpoint["training_config"]["precision"] == "bf16"
 
 
+def test_train_v1_rejects_torch_compile_without_cuda(tmp_path: Path) -> None:
+    manifest_path = _write_training_manifest(tmp_path)
+
+    with pytest.raises(ValueError, match="torch.compile.*CUDA"):
+        main(
+            [
+                "--manifest",
+                str(manifest_path),
+                "--device",
+                "cpu",
+                "--compile",
+                "--wandb-mode",
+                "disabled",
+            ]
+        )
+
+
 def test_train_v1_runs_a_complete_mixed_recipe_with_wsd(tmp_path: Path) -> None:
     recipe_path = _write_recipe(tmp_path)
     uninterrupted_dir = tmp_path / "uninterrupted"
@@ -230,6 +247,10 @@ def test_train_v1_runs_a_complete_mixed_recipe_with_wsd(tmp_path: Path) -> None:
     assert checkpoint["step"] == 4
     assert checkpoint["data_position"] == 8
     assert checkpoint["tokens_seen"] == 32
+    assert checkpoint["source_tokens_seen"] == {
+        "fineweb_edu": 20,
+        "stack_edu": 12,
+    }
     assert checkpoint["training_config"]["learning_rate_schedule"] == "wsd"
     assert checkpoint["training_config"]["decay_start_step"] == 3
     assert checkpoint["training_config"]["min_learning_rate"] == 0.0

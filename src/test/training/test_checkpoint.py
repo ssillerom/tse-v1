@@ -277,6 +277,7 @@ def test_checkpoint_validates_the_training_run_configuration(tmp_path: Path) -> 
         optimizer_betas=(0.9, 0.95),
         optimizer_weight_decay=0.1,
         optimizer_eps=1e-8,
+        source_token_budgets=(("web", 12), ("math", 4)),
     )
     checkpoint_path = save_checkpoint(
         path=tmp_path / "step_000000.pt",
@@ -294,6 +295,28 @@ def test_checkpoint_validates_the_training_run_configuration(tmp_path: Path) -> 
         optimizer_betas=(0.9, 0.95),
         optimizer_weight_decay=0.1,
         optimizer_eps=1e-8,
+        source_token_budgets=(("web", 12), ("math", 4)),
+    )
+
+    with pytest.raises(ValueError, match="checkpoint run_config does not match"):
+        restore_checkpoint(
+            path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            training_config=training_config,
+            run_config=different_run_config,
+        )
+
+    different_run_config = TrainingRunConfig(
+        data_contract_sha256="a" * 64,
+        seed=42,
+        batch_size=2,
+        optimizer_name="AdamW",
+        optimizer_betas=(0.9, 0.95),
+        optimizer_weight_decay=0.1,
+        optimizer_eps=1e-8,
+        compile_mode="default",
+        source_token_budgets=(("web", 12), ("math", 4)),
     )
 
     with pytest.raises(ValueError, match="checkpoint run_config does not match"):
@@ -313,6 +336,7 @@ def test_checkpoint_validates_the_training_run_configuration(tmp_path: Path) -> 
         optimizer_betas=(0.9, 0.95),
         optimizer_weight_decay=0.1,
         optimizer_eps=1e-8,
+        source_token_budgets=(("web", 12), ("math", 4)),
     )
 
     with pytest.raises(ValueError, match="checkpoint run_config does not match"):
@@ -323,6 +347,61 @@ def test_checkpoint_validates_the_training_run_configuration(tmp_path: Path) -> 
             training_config=training_config,
             run_config=different_run_config,
         )
+
+
+def test_checkpoint_persists_the_configured_recipe_mix(tmp_path: Path) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=1)
+    run_config = TrainingRunConfig(
+        data_contract_sha256="a" * 64,
+        seed=42,
+        batch_size=2,
+        optimizer_name="AdamW",
+        optimizer_betas=(0.9, 0.95),
+        optimizer_weight_decay=0.1,
+        optimizer_eps=1e-8,
+        source_token_budgets=(("web", 12), ("math", 4)),
+    )
+
+    checkpoint_path = save_checkpoint(
+        path=tmp_path / "step_000000.pt",
+        model=model,
+        optimizer=optimizer,
+        step=0,
+        training_config=training_config,
+        run_config=run_config,
+    )
+
+    payload = torch.load(checkpoint_path, weights_only=True)
+
+    assert payload["run_config"]["source_token_budgets"] == (("web", 12), ("math", 4))
+
+
+def test_checkpoint_preserves_exact_tokens_consumed_per_recipe_source(
+    tmp_path: Path,
+) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=1)
+    checkpoint_path = save_checkpoint(
+        path=tmp_path / "step_000001.pt",
+        model=model,
+        optimizer=optimizer,
+        step=1,
+        training_config=training_config,
+        tokens_seen=16,
+        source_tokens_seen={"web": 12, "math": 4},
+    )
+
+    restored = restore_checkpoint(
+        path=checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        training_config=training_config,
+    )
+
+    assert restored.source_tokens_seen == {"web": 12, "math": 4}
 
 
 def test_checkpoint_v1_without_precision_loads_as_fp32(tmp_path: Path) -> None:
@@ -393,6 +472,47 @@ def test_checkpoint_v1_without_run_config_loads_with_an_explicit_warning(
     assert restored.step == 0
 
 
+def test_legacy_recipe_checkpoint_uses_the_expected_source_budgets_with_a_warning(
+    tmp_path: Path,
+) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=1)
+    run_config = TrainingRunConfig(
+        data_contract_sha256="a" * 64,
+        seed=42,
+        batch_size=2,
+        optimizer_name="AdamW",
+        optimizer_betas=(0.9, 0.95),
+        optimizer_weight_decay=0.1,
+        optimizer_eps=1e-8,
+        source_token_budgets=(("web", 12), ("math", 4)),
+    )
+    checkpoint_path = save_checkpoint(
+        path=tmp_path / "step_000000.pt",
+        model=model,
+        optimizer=optimizer,
+        step=0,
+        training_config=training_config,
+        run_config=run_config,
+    )
+    payload = torch.load(checkpoint_path, weights_only=True)
+    payload["format_version"] = 4
+    payload["run_config"].pop("source_token_budgets")
+    torch.save(payload, checkpoint_path)
+
+    with pytest.warns(RuntimeWarning, match="has no source token budgets"):
+        restored = restore_checkpoint(
+            path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            training_config=training_config,
+            run_config=run_config,
+        )
+
+    assert restored.step == 0
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -403,6 +523,7 @@ def test_checkpoint_v1_without_run_config_loads_with_an_explicit_warning(
         ("optimizer_betas", (0.9, 1.0), "optimizer_betas"),
         ("optimizer_weight_decay", -0.1, "optimizer_weight_decay"),
         ("optimizer_eps", 0.0, "optimizer_eps"),
+        ("compile_mode", "fastest", "compile_mode"),
     ],
 )
 def test_training_run_config_rejects_invalid_values(

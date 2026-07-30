@@ -13,9 +13,15 @@ dependencies = [
 ]
 
 [project.scripts]
+eval-checkpoint = "src.scripts.eval_checkpoint:main"
 inspect-data-slices = "src.scripts.inspect_slices:main"
 prepare-data = "src.data.prepare_data:main"
 train-v1 = "src.scripts.train_v1:main"
+
+[project.optional-dependencies]
+eval = [
+    "lm-eval>=0.4.12,<0.5",
+]
 
 [dependency-groups]
 dev = [
@@ -45,4 +51,8 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
-files = ["src/data", "src/scripts", "src/training"]
+files = ["src/data", "src/evaluation", "src/scripts", "src/training"]
+
+[[tool.mypy.overrides]]
+module = ["lm_eval", "lm_eval.*"]
+ignore_missing_imports = true
