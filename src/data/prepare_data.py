@@ -20,17 +20,20 @@ from itertools import islice
 from pathlib import Path
 from typing import cast
 
+import datasets as hf_datasets  # type: ignore[import-untyped]
 import duckdb
 import numpy as np
 import tiktoken
-from datasets import load_dataset  # type: ignore[import-untyped]
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.utils.tqdm import disable_progress_bars as disable_hf_progress_bars
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset as TorchDataset
 
 from src.data.manifest import FORMAT_VERSION, STORAGE_DTYPE, write_manifest
 
 LOGGER = logging.getLogger(__name__)
+disable_datasets_progress_bars = hf_datasets.disable_progress_bars
+load_dataset = hf_datasets.load_dataset
 UINT16_MAX = int(np.iinfo(np.uint16).max)
 SHARD_FILENAME_PATTERN = re.compile(r"shard_\d{4,}\.bin(?:\.tmp)?\Z")
 GENERATED_DIRECTORY_NAMES = frozenset({"train", "validation"})
@@ -68,6 +71,19 @@ class ShardMetadata:
     file: str
     tokens: int
     sha256: str
+
+
+@dataclass(frozen=True)
+class PreparationStats:
+    """Counters reported only after a prepared dataset is published."""
+
+    tokens: int
+    shards: int
+    docs_seen: int
+    docs_used: int
+    docs_skipped: int
+    docs_truncated: int
+    split_tokens: tuple[tuple[str, int], ...]
 
 
 @dataclass(frozen=True)
@@ -165,13 +181,6 @@ class TokenShardWriter:
                 tokens=token_count,
                 sha256=sha256,
             )
-        )
-        LOGGER.info(
-            "Saved shard %04d | %12s tokens | %14s total | %s",
-            self.shard_idx,
-            f"{token_count:,}",
-            f"{self.total_tokens:,}",
-            shard_path,
         )
         self.shard_idx += 1
         self.pos = 0
@@ -612,7 +621,6 @@ def _install_staged_artifacts(staging_dir: Path, output_dir: Path) -> None:
 
 def _prepare_into_staging_directory(
     staging_dir: Path,
-    destination_dir: Path,
     dataset: Iterable[Mapping[str, object]],
     dataset_manifest: Mapping[str, object],
     source_split: str,
@@ -627,7 +635,7 @@ def _prepare_into_staging_directory(
     split_seed: int,
     encoding: tiktoken.Encoding,
     encoding_name: str,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], PreparationStats]:
     output_splits = (source_split,) if validation_ratio == 0.0 else ("train", "validation")
     split_output_dirs = (
         {source_split: staging_dir}
@@ -645,22 +653,11 @@ def _prepare_into_staging_directory(
         for split_name in output_splits
     }
     split_counts = {split_name: {"docs_used": 0, "docs_truncated": 0} for split_name in writers}
-    LOGGER.info("Preparing dataset into %s", destination_dir)
-    LOGGER.info(
-        "Target: %s tokens | max documents: %s | shard size: %s | encoding: %s | workers: %s",
-        f"{num_tokens:,}",
-        "unlimited" if max_docs is None else f"{max_docs:,}",
-        f"{shard_size:,}",
-        encoding_name,
-        f"{workers:,}",
-    )
-
     docs_seen = 0
     docs_used = 0
     docs_skipped = 0
     docs_truncated = 0
     total_tokens = 0
-    started_at = time.perf_counter()
 
     document_iterator = iter(dataset)
     source_exhausted = False
@@ -744,15 +741,17 @@ def _prepare_into_staging_directory(
                     split_counts[output_split]["docs_truncated"] += 1
 
             if docs_seen >= next_log_at:
-                elapsed = time.perf_counter() - started_at
-                tokens_per_second = total_tokens / max(elapsed, 1e-9)
+                saved_tokens = sum(
+                    shard.tokens for writer in writers.values() for shard in writer.shards
+                )
+                saved_shards = sum(len(writer.shards) for writer in writers.values())
+                percentage = saved_tokens / num_tokens * 100
                 LOGGER.info(
-                    "docs_seen=%s | docs_used=%s | skipped=%s | tokens=%s | tok/s=%s",
-                    f"{docs_seen:,}",
-                    f"{docs_used:,}",
-                    f"{docs_skipped:,}",
-                    f"{total_tokens:,}",
-                    f"{tokens_per_second:,.0f}",
+                    "Progress | tokens_saved=%s/%s (%.1f%%) | shards=%s",
+                    f"{saved_tokens:,}",
+                    f"{num_tokens:,}",
+                    percentage,
+                    f"{saved_shards:,}",
                 )
                 next_log_at += log_every_docs
 
@@ -764,7 +763,6 @@ def _prepare_into_staging_directory(
 
     for writer in writers.values():
         writer.flush()
-    elapsed = time.perf_counter() - started_at
     total_tokens = sum(writer.total_tokens for writer in writers.values())
     total_shards = sum(writer.shard_idx for writer in writers.values())
     shards: list[dict[str, object]] = []
@@ -812,17 +810,44 @@ def _prepare_into_staging_directory(
         "shards": shards,
     }
     write_manifest(staging_dir / "manifest.json", manifest)
+    stats = PreparationStats(
+        tokens=total_tokens,
+        shards=total_shards,
+        docs_seen=docs_seen,
+        docs_used=docs_used,
+        docs_skipped=docs_skipped,
+        docs_truncated=docs_truncated,
+        split_tokens=tuple(
+            (split_name, writer.total_tokens) for split_name, writer in writers.items()
+        ),
+    )
+    return manifest, stats
 
-    tokens_per_second = total_tokens / max(elapsed, 1e-9)
+
+def _log_preparation_summary(stats: PreparationStats, elapsed: float) -> None:
+    tokens_per_second = stats.tokens / max(elapsed, 1e-9)
+    split_token_stats = " | ".join(
+        f"{split_name}={tokens:,}" for split_name, tokens in stats.split_tokens
+    )
+    elapsed_seconds = max(0, round(elapsed))
+    elapsed_hours, remaining_seconds = divmod(elapsed_seconds, 3600)
+    elapsed_minutes, elapsed_seconds = divmod(remaining_seconds, 60)
+    elapsed_text = f"{elapsed_hours}h {elapsed_minutes:02d}m {elapsed_seconds:02d}s"
+    LOGGER.info("Completed")
+    LOGGER.info("Tokens | total=%s | %s", f"{stats.tokens:,}", split_token_stats)
+    LOGGER.info("Shards | total=%s", f"{stats.shards:,}")
     LOGGER.info(
-        "Done: %s tokens in %s shards from %s documents (%.2f h, %s tok/s)",
-        f"{total_tokens:,}",
-        f"{total_shards:,}",
-        f"{docs_seen:,}",
-        elapsed / 3600,
+        "Documents | seen=%s | used=%s | skipped=%s | truncated=%s",
+        f"{stats.docs_seen:,}",
+        f"{stats.docs_used:,}",
+        f"{stats.docs_skipped:,}",
+        f"{stats.docs_truncated:,}",
+    )
+    LOGGER.info(
+        "Performance | elapsed=%s | throughput=%s tok/s",
+        elapsed_text,
         f"{tokens_per_second:,.0f}",
     )
-    return manifest
 
 
 def prepare_streaming_dataset(
@@ -888,6 +913,7 @@ def prepare_streaming_dataset(
             "Pass overwrite=True only if replacing them is intentional."
         )
 
+    started_at = time.perf_counter()
     if source_reader == "duckdb":
         dataset = load_streaming_duckdb_dataset(
             dataset_name=dataset_name,
@@ -938,9 +964,8 @@ def prepare_streaming_dataset(
     ) as staging_name:
         staging_path = Path(staging_name)
         try:
-            manifest = _prepare_into_staging_directory(
+            manifest, stats = _prepare_into_staging_directory(
                 staging_dir=staging_path,
-                destination_dir=output_path,
                 dataset=dataset,
                 dataset_manifest=dataset_manifest,
                 source_split=split,
@@ -962,6 +987,7 @@ def prepare_streaming_dataset(
                 close_dataset()
         _install_staged_artifacts(staging_path, output_path)
 
+    _log_preparation_summary(stats, time.perf_counter() - started_at)
     return manifest
 
 
@@ -1001,7 +1027,12 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--num-tokens", required=True, type=int)
     prepare_parser.add_argument("--shard-size", type=int, default=100_000_000)
     prepare_parser.add_argument("--min-chars", type=int, default=0)
-    prepare_parser.add_argument("--log-every-docs", type=int, default=10_000)
+    prepare_parser.add_argument(
+        "--log-every-docs",
+        type=int,
+        default=10_000,
+        help="Emit compact token and shard progress after this many source documents",
+    )
     prepare_parser.add_argument(
         "--workers",
         type=int,
@@ -1053,7 +1084,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface."""
     args = build_parser().parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    disable_datasets_progress_bars()
+    disable_hf_progress_bars()
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    LOGGER.setLevel(logging.INFO)
 
     if args.command == "inspect":
         inspect_dataset(

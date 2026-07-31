@@ -849,7 +849,9 @@ def test_prepare_preserves_previous_dataset_when_replacement_fails(
 
 
 def test_prepare_restores_previous_dataset_when_installation_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     old_shard = tmp_path / "shard_0000.bin"
     old_manifest = tmp_path / "manifest.json"
@@ -875,6 +877,7 @@ def test_prepare_restores_previous_dataset_when_installation_fails(
 
     monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
     monkeypatch.setattr("data.prepare_data.os.replace", fail_staged_shard_install)
+    caplog.set_level("INFO", logger="data.prepare_data")
 
     with pytest.raises(OSError, match="staged shard install failed"):
         prepare_streaming_dataset(
@@ -889,6 +892,7 @@ def test_prepare_restores_previous_dataset_when_installation_fails(
     assert old_shard.read_bytes() == b"known-good-data"
     assert old_manifest.read_text() == '{"status": "known-good"}'
     assert not any(path.name.startswith(".prepare-data-") for path in tmp_path.iterdir())
+    assert not any(record.getMessage() == "Completed" for record in caplog.records)
 
 
 def test_prepare_restores_previous_split_dataset_when_installation_fails(
@@ -1067,3 +1071,51 @@ def test_cli_prepare_executes_with_parsed_arguments(
     assert exit_code == 0
     assert manifest["dataset"]["text_field"] == "body"
     assert manifest["dataset"]["revision"] == "fixed"
+
+
+def test_cli_prepare_logs_compact_progress_and_final_stats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fake_load_dataset(**kwargs: object) -> list[dict[str, str]]:
+        del kwargs
+        return [{"text": "hello"}, {"text": "hello"}, {"text": "hello"}]
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+    caplog.set_level("INFO", logger="data.prepare_data")
+
+    exit_code = main(
+        [
+            "prepare",
+            "--dataset-name",
+            "example/dataset",
+            "--output-dir",
+            str(tmp_path),
+            "--text-field",
+            "text",
+            "--num-tokens",
+            "6",
+            "--shard-size",
+            "3",
+            "--log-every-docs",
+            "1",
+        ]
+    )
+
+    messages = [
+        record.getMessage() for record in caplog.records if record.name == "data.prepare_data"
+    ]
+    assert exit_code == 0
+    assert messages[:-1] == [
+        "Progress | tokens_saved=0/6 (0.0%) | shards=0",
+        "Progress | tokens_saved=3/6 (50.0%) | shards=1",
+        "Progress | tokens_saved=6/6 (100.0%) | shards=2",
+        "Completed",
+        "Tokens | total=6 | train=6",
+        "Shards | total=2",
+        "Documents | seen=3 | used=3 | skipped=0 | truncated=0",
+    ]
+    assert messages[-1].startswith("Performance | elapsed=")
+    assert messages[-1].endswith(" tok/s")
+    assert not any("docs_seen=" in message or "Saved shard" in message for message in messages)

@@ -88,6 +88,18 @@ anticipadamente hasta `--source-workers` Parquet, los procesa en orden de nombre
 cada copia temporal al terminarla. DuckDB entrega un archivo de código por fila; la
 tokenización y el formato de salida son los mismos que con el lector predeterminado.
 
+Durante `prepare`, `--log-every-docs` controla cada cuántos documentos se imprime una línea
+compacta; las barras de progreso de las librerías de origen permanecen ocultas:
+
+```text
+Progress | tokens_saved=100,000,000/700,000,000 (14.3%) | shards=1
+```
+
+Al terminar se muestran tokens totales y por split, shards, contadores de documentos, tiempo
+y throughput. Durante el progreso, `tokens_saved` y `shards` cuentan únicamente shards
+completos escritos en staging. `Completed` solo aparece después de publicar atómicamente los
+shards y el manifest en el directorio de destino.
+
 La preparación nueva publica manifest v3. Cada entrada de `shards` incluye el SHA-256 del
 fichero y `load_manifest()` lo verifica además del tamaño antes de abrir los datos. Los
 manifest v2 existentes siguen siendo legibles, pero no ofrecen esta comprobación porque
