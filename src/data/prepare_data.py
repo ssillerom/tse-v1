@@ -22,6 +22,8 @@ from typing import cast
 import numpy as np
 import tiktoken
 from datasets import load_dataset  # type: ignore[import-untyped]
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset as TorchDataset
 
 from src.data.manifest import FORMAT_VERSION, STORAGE_DTYPE, write_manifest
 
@@ -29,6 +31,8 @@ LOGGER = logging.getLogger(__name__)
 UINT16_MAX = int(np.iinfo(np.uint16).max)
 SHARD_FILENAME_PATTERN = re.compile(r"shard_\d{4,}\.bin(?:\.tmp)?\Z")
 GENERATED_DIRECTORY_NAMES = frozenset({"train", "validation"})
+TOKENIZATION_BATCH_MAX_DOCS = 256
+TOKENIZATION_BATCH_MAX_CHARS = 4_000_000
 
 
 def _find_generated_artifacts(output_dir: Path) -> list[Path]:
@@ -245,6 +249,33 @@ def _iter_source_documents(
             yield nested_record
 
 
+def _identity_collate(document: object) -> object:
+    return document
+
+
+def _parallel_source_documents(
+    dataset: Iterable[Mapping[str, object]],
+    source_workers: int,
+) -> Iterable[Mapping[str, object]]:
+    if source_workers == 0:
+        return dataset
+    if not isinstance(dataset, TorchDataset):
+        raise TypeError(
+            "source_workers requires a Hugging Face or PyTorch Dataset that supports "
+            "multi-process loading"
+        )
+    return cast(
+        Iterable[Mapping[str, object]],
+        DataLoader(
+            dataset,
+            batch_size=None,
+            num_workers=source_workers,
+            collate_fn=_identity_collate,
+            prefetch_factor=1,
+        ),
+    )
+
+
 def inspect_dataset(
     dataset_name: str,
     split: str = "train",
@@ -292,6 +323,8 @@ def _validate_preparation_limits(
     shard_size: int,
     min_chars: int,
     log_every_docs: int,
+    workers: int,
+    source_workers: int,
     max_docs: int | None,
     validation_ratio: float,
 ) -> None:
@@ -303,6 +336,10 @@ def _validate_preparation_limits(
         raise ValueError("min_chars cannot be negative")
     if log_every_docs <= 0:
         raise ValueError("log_every_docs must be positive")
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+    if source_workers < 0:
+        raise ValueError("source_workers cannot be negative")
     if max_docs is not None and max_docs <= 0:
         raise ValueError("max_docs must be positive")
     if not 0.0 <= validation_ratio < 1.0:
@@ -394,6 +431,7 @@ def _prepare_into_staging_directory(
     shard_size: int,
     min_chars: int,
     log_every_docs: int,
+    workers: int,
     max_docs: int | None,
     validation_ratio: float,
     split_seed: int,
@@ -419,11 +457,12 @@ def _prepare_into_staging_directory(
     split_counts = {split_name: {"docs_used": 0, "docs_truncated": 0} for split_name in writers}
     LOGGER.info("Preparing dataset into %s", destination_dir)
     LOGGER.info(
-        "Target: %s tokens | max documents: %s | shard size: %s | encoding: %s",
+        "Target: %s tokens | max documents: %s | shard size: %s | encoding: %s | workers: %s",
         f"{num_tokens:,}",
         "unlimited" if max_docs is None else f"{max_docs:,}",
         f"{shard_size:,}",
         encoding_name,
+        f"{workers:,}",
     )
 
     docs_seen = 0
@@ -433,57 +472,105 @@ def _prepare_into_staging_directory(
     total_tokens = 0
     started_at = time.perf_counter()
 
-    for document in dataset:
-        if max_docs is not None and docs_seen >= max_docs:
-            break
-        docs_seen += 1
-        if text_field not in document:
-            raise KeyError(
-                f"text_field={text_field!r} not found. Available keys: {list(document.keys())}"
-            )
+    document_iterator = iter(dataset)
+    source_exhausted = False
+    source_error: Exception | None = None
+    next_log_at = log_every_docs
+    while total_tokens < num_tokens and not source_exhausted:
+        batch_documents: list[str | None] = []
+        texts: list[str] = []
+        batch_chars = 0
+        while (
+            len(batch_documents) < TOKENIZATION_BATCH_MAX_DOCS
+            and batch_chars < TOKENIZATION_BATCH_MAX_CHARS
+        ):
+            if max_docs is not None and docs_seen + len(batch_documents) >= max_docs:
+                source_exhausted = True
+                break
+            try:
+                document = next(document_iterator)
+            except StopIteration:
+                source_exhausted = True
+                break
+            except Exception as error:
+                source_error = error
+                source_exhausted = True
+                break
 
-        text = document[text_field]
-        if not isinstance(text, str) or len(text) < min_chars:
-            docs_skipped += 1
-            continue
+            if text_field not in document:
+                source_error = KeyError(
+                    f"text_field={text_field!r} not found. Available keys: {list(document.keys())}"
+                )
+                source_exhausted = True
+                break
 
-        tokens = encoding.encode(text, disallowed_special=())
-        tokens.append(encoding.eot_token)
-        output_split = _document_output_split(
-            text,
-            source_split,
-            validation_ratio,
-            split_seed,
-        )
-        writer = writers[output_split]
-        remaining_tokens = num_tokens - total_tokens
-        document_truncated = len(tokens) > remaining_tokens
-        tokens_to_write = tokens if not document_truncated else tokens[:remaining_tokens]
-        if document_truncated:
-            tokens_to_write[-1] = encoding.eot_token
-        tokens_added = writer.add_tokens(tokens_to_write)
-        total_tokens += tokens_added
-        if tokens_added > 0:
-            docs_used += 1
-            split_counts[output_split]["docs_used"] += 1
-        if document_truncated:
-            docs_truncated += 1
-            split_counts[output_split]["docs_truncated"] += 1
+            text = document[text_field]
+            if not isinstance(text, str) or len(text) < min_chars:
+                batch_documents.append(None)
+                continue
+            batch_documents.append(text)
+            texts.append(text)
+            batch_chars += len(text)
 
-        if docs_seen % log_every_docs == 0:
-            elapsed = time.perf_counter() - started_at
-            tokens_per_second = total_tokens / max(elapsed, 1e-9)
-            LOGGER.info(
-                "docs_seen=%s | docs_used=%s | skipped=%s | tokens=%s | tok/s=%s",
-                f"{docs_seen:,}",
-                f"{docs_used:,}",
-                f"{docs_skipped:,}",
-                f"{total_tokens:,}",
-                f"{tokens_per_second:,.0f}",
-            )
+        encoded_documents: list[list[int]] = []
+        if texts:
+            if workers == 1:
+                encoded_documents = [encoding.encode(text, disallowed_special=()) for text in texts]
+            else:
+                encoded_documents = encoding.encode_batch(
+                    texts,
+                    num_threads=workers,
+                    disallowed_special=(),
+                )
 
-        if total_tokens >= num_tokens:
-            break
+        encoded_index = 0
+        for text in batch_documents:
+            docs_seen += 1
+            if text is None:
+                docs_skipped += 1
+            else:
+                tokens = encoded_documents[encoded_index]
+                encoded_index += 1
+                tokens.append(encoding.eot_token)
+                output_split = _document_output_split(
+                    text,
+                    source_split,
+                    validation_ratio,
+                    split_seed,
+                )
+                writer = writers[output_split]
+                remaining_tokens = num_tokens - total_tokens
+                document_truncated = len(tokens) > remaining_tokens
+                tokens_to_write = tokens if not document_truncated else tokens[:remaining_tokens]
+                if document_truncated:
+                    tokens_to_write[-1] = encoding.eot_token
+                tokens_added = writer.add_tokens(tokens_to_write)
+                total_tokens += tokens_added
+                if tokens_added > 0:
+                    docs_used += 1
+                    split_counts[output_split]["docs_used"] += 1
+                if document_truncated:
+                    docs_truncated += 1
+                    split_counts[output_split]["docs_truncated"] += 1
+
+            if docs_seen >= next_log_at:
+                elapsed = time.perf_counter() - started_at
+                tokens_per_second = total_tokens / max(elapsed, 1e-9)
+                LOGGER.info(
+                    "docs_seen=%s | docs_used=%s | skipped=%s | tokens=%s | tok/s=%s",
+                    f"{docs_seen:,}",
+                    f"{docs_used:,}",
+                    f"{docs_skipped:,}",
+                    f"{total_tokens:,}",
+                    f"{tokens_per_second:,.0f}",
+                )
+                next_log_at += log_every_docs
+
+            if total_tokens >= num_tokens:
+                break
+
+        if source_error is not None and total_tokens < num_tokens:
+            raise source_error
 
     for writer in writers.values():
         writer.flush()
@@ -561,6 +648,8 @@ def prepare_streaming_dataset(
     hf_token: bool = False,
     min_chars: int = 0,
     log_every_docs: int = 10_000,
+    workers: int = 1,
+    source_workers: int = 0,
     max_docs: int | None = None,
     validation_ratio: float = 0.0,
     split_seed: int = 42,
@@ -575,6 +664,8 @@ def prepare_streaming_dataset(
         shard_size,
         min_chars,
         log_every_docs,
+        workers,
+        source_workers,
         max_docs,
         validation_ratio,
     )
@@ -600,14 +691,18 @@ def prepare_streaming_dataset(
             "Pass overwrite=True only if replacing them is intentional."
         )
 
+    source_dataset = load_streaming_hf_dataset(
+        dataset_name=dataset_name,
+        split=split,
+        name=name,
+        data_dir=data_dir,
+        revision=revision,
+        hf_token=hf_token,
+    )
     dataset = _iter_source_documents(
-        dataset=load_streaming_hf_dataset(
-            dataset_name=dataset_name,
-            split=split,
-            name=name,
-            data_dir=data_dir,
-            revision=revision,
-            hf_token=hf_token,
+        dataset=_parallel_source_documents(
+            dataset=source_dataset,
+            source_workers=source_workers,
         ),
         records_field=records_field,
         record_filters=parsed_record_filter,
@@ -623,6 +718,8 @@ def prepare_streaming_dataset(
     if records_field is not None:
         dataset_manifest["records_field"] = records_field
         dataset_manifest["record_filter"] = record_filter
+    if source_workers > 0:
+        dataset_manifest["source_workers"] = source_workers
 
     with tempfile.TemporaryDirectory(
         prefix=".prepare-data-staging-",
@@ -640,6 +737,7 @@ def prepare_streaming_dataset(
             shard_size=shard_size,
             min_chars=min_chars,
             log_every_docs=log_every_docs,
+            workers=workers,
             max_docs=max_docs,
             validation_ratio=validation_ratio,
             split_seed=split_seed,
@@ -688,6 +786,18 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--shard-size", type=int, default=100_000_000)
     prepare_parser.add_argument("--min-chars", type=int, default=0)
     prepare_parser.add_argument("--log-every-docs", type=int, default=10_000)
+    prepare_parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of tokenizer threads used for deterministic batch encoding",
+    )
+    prepare_parser.add_argument(
+        "--source-workers",
+        type=int,
+        default=0,
+        help="Number of processes used to download and decode source shards",
+    )
     prepare_parser.add_argument(
         "--max-docs",
         type=int,
@@ -750,6 +860,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         hf_token=args.hf_token,
         min_chars=args.min_chars,
         log_every_docs=args.log_every_docs,
+        workers=args.workers,
+        source_workers=args.source_workers,
         max_docs=args.max_docs,
         validation_ratio=args.validation_ratio,
         split_seed=args.split_seed,

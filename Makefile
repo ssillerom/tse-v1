@@ -9,6 +9,8 @@ WANDB_PROJECT ?= llm-from-scratch
 WANDB_ENTITY ?=
 WANDB_MODE ?= online
 NUM_WORKERS ?= 4
+PREPARE_WORKERS ?= 2
+PREPARE_SOURCE_WORKERS ?= 2
 MAX_LEARNING_RATE ?= 0.0006
 TORCH_COMPILE_ARGS ?=
 A100_BATCH_SIZE ?= 8
@@ -139,6 +141,8 @@ $(FINEWEB_MANIFEST):
 		--output-dir data/pretrain-v1/fineweb-edu-sample-10bt \
 		--num-tokens 10000000000 \
 		--shard-size $(SHARD_SIZE) \
+		--workers $(PREPARE_WORKERS) \
+		--source-workers $(PREPARE_SOURCE_WORKERS) \
 		--validation-ratio 0.01 \
 		--split-seed $(SPLIT_SEED) \
 		--encoding gpt2
@@ -157,6 +161,8 @@ $(STACK_MANIFEST):
 		--num-tokens 770000000 \
 		--shard-size $(SHARD_SIZE) \
 		--min-chars 64 \
+		--workers $(PREPARE_WORKERS) \
+		--source-workers $(PREPARE_SOURCE_WORKERS) \
 		--validation-ratio 0.02 \
 		--split-seed $(SPLIT_SEED) \
 		--encoding gpt2
@@ -174,6 +180,8 @@ $(MATH_3_MANIFEST):
 		--output-dir data/pretrain-v1/nemotron-math-3 \
 		--num-tokens 415000000 \
 		--shard-size $(SHARD_SIZE) \
+		--workers $(PREPARE_WORKERS) \
+		--source-workers $(PREPARE_SOURCE_WORKERS) \
 		--validation-ratio 0.02 \
 		--split-seed $(SPLIT_SEED) \
 		--encoding gpt2
@@ -190,6 +198,8 @@ $(FINEWIKI_MANIFEST):
 		--output-dir data/pretrain-v1/finewiki-en \
 		--num-tokens 930000000 \
 		--shard-size $(SHARD_SIZE) \
+		--workers $(PREPARE_WORKERS) \
+		--source-workers $(PREPARE_SOURCE_WORKERS) \
 		--validation-ratio 0.02 \
 		--split-seed $(SPLIT_SEED) \
 		--encoding gpt2
@@ -207,6 +217,8 @@ $(MATH_4PLUS_MANIFEST):
 		--output-dir data/pretrain-v1/nemotron-math-4plus \
 		--num-tokens 110000000 \
 		--shard-size $(SHARD_SIZE) \
+		--workers $(PREPARE_WORKERS) \
+		--source-workers $(PREPARE_SOURCE_WORKERS) \
 		--validation-ratio 0.02 \
 		--split-seed $(SPLIT_SEED) \
 		--encoding gpt2
@@ -223,6 +235,8 @@ $(FACT_MANIFEST):
 		--output-dir data/pretrain-v1/nemotron-fact-seeking \
 		--num-tokens 60000000 \
 		--shard-size $(SHARD_SIZE) \
+		--workers $(PREPARE_WORKERS) \
+		--source-workers $(PREPARE_SOURCE_WORKERS) \
 		--validation-ratio 0.02 \
 		--split-seed $(SPLIT_SEED) \
 		--encoding gpt2

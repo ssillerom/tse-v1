@@ -52,6 +52,8 @@ uv run prepare-data prepare \
   --output-dir data/fineweb-edu-50 \
   --num-tokens 10000000 \
   --shard-size 100000 \
+  --workers 2 \
+  --source-workers 2 \
   --max-docs 50 \
   --validation-ratio 0.1 \
   --split-seed 42 \
@@ -73,6 +75,12 @@ data/fineweb-edu-50/
 exactamente 45/5. Los duplicados exactos se asignan siempre al mismo split. Cada documento
 termina en EOT incluso cuando `--num-tokens` obliga a truncarlo: el último token de contenido
 aceptado se sustituye por EOT.
+
+`--workers` paraleliza la tokenización por lotes sin cambiar el orden recibido.
+`--source-workers` reparte los shards remotos entre procesos para solapar descarga,
+descompresión y decodificación. Para una preparación reproducible hay que fijar ambos valores:
+el número de procesos de origen queda registrado en el manifest porque puede cambiar el orden
+en que los shards de Hugging Face alcanzan el límite global de tokens.
 
 La preparación nueva publica manifest v3. Cada entrada de `shards` incluye el SHA-256 del
 fichero y `load_manifest()` lo verifica además del tamaño antes de abrir los datos. Los

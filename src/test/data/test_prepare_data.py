@@ -1,10 +1,16 @@
 import json
+import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
 import pytest
 import tiktoken
+from datasets import IterableDataset as HuggingFaceIterableDataset
+from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data import IterableDataset as TorchIterableDataset
 
+from data.dataset import PretrainingDataset
 from data.prepare_data import (
     TokenShardWriter,
     build_parser,
@@ -12,6 +18,22 @@ from data.prepare_data import (
     main,
     prepare_streaming_dataset,
 )
+
+
+def _yield_worker_documents(shards: list[str]) -> Iterator[dict[str, str]]:
+    for shard in shards:
+        yield {"text": f"worker={os.getpid()} shard={shard}"}
+
+
+class _WorkerDocumentDataset(TorchDataset[dict[str, str]]):
+    def __init__(self, shards: list[str]) -> None:
+        self.shards = shards
+
+    def __len__(self) -> int:
+        return len(self.shards)
+
+    def __getitem__(self, index: int) -> dict[str, str]:
+        return {"text": f"worker={os.getpid()} shard={self.shards[index]}"}
 
 
 def test_writer_rejects_non_positive_shard_size(tmp_path: Path) -> None:
@@ -129,6 +151,8 @@ def test_inspection_forwards_data_dir_to_hugging_face(
         ("shard_size", 0, "shard_size must be positive"),
         ("min_chars", -1, "min_chars cannot be negative"),
         ("log_every_docs", 0, "log_every_docs must be positive"),
+        ("workers", 0, "workers must be positive"),
+        ("source_workers", -1, "source_workers cannot be negative"),
         ("max_docs", 0, "max_docs must be positive"),
         (
             "validation_ratio",
@@ -161,6 +185,8 @@ def test_prepare_rejects_invalid_limits_before_loading_the_dataset(
         "shard_size": 4,
         "min_chars": 0,
         "log_every_docs": 100,
+        "workers": 1,
+        "source_workers": 0,
     }
     arguments[invalid_argument] = invalid_value
 
@@ -332,6 +358,7 @@ def test_prepare_can_flatten_and_filter_nested_source_records(
         text_field="content",
         num_tokens=1_000,
         shard_size=1_000,
+        workers=4,
     )
 
     assert manifest["dataset"] == {
@@ -442,6 +469,198 @@ def test_prepare_limits_documents_and_creates_a_deterministic_validation_split(
         assert (output_dirs[0] / relative_path).read_bytes() == (
             output_dirs[1] / relative_path
         ).read_bytes()
+
+
+def test_parallel_prepare_matches_sequential_output_and_loads_for_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    documents = [
+        {"text": f"parallel preparation document {index} with enough content"}
+        for index in range(80)
+    ]
+
+    def fake_load_dataset(**kwargs: object) -> list[dict[str, str]]:
+        del kwargs
+        return documents
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+    sequential_dir = tmp_path / "sequential"
+    parallel_dir = tmp_path / "parallel"
+
+    for output_dir, workers in ((sequential_dir, 1), (parallel_dir, 4)):
+        prepare_streaming_dataset(
+            output_dir=output_dir,
+            dataset_name="example/dataset",
+            text_field="text",
+            num_tokens=1_000,
+            shard_size=100,
+            validation_ratio=0.2,
+            split_seed=7,
+            workers=workers,
+        )
+
+    sequential_manifest = json.loads((sequential_dir / "manifest.json").read_text())
+    parallel_manifest = json.loads((parallel_dir / "manifest.json").read_text())
+    assert parallel_manifest == sequential_manifest
+    for shard in parallel_manifest["shards"]:
+        relative_path = Path(shard["file"])
+        assert (parallel_dir / relative_path).read_bytes() == (
+            sequential_dir / relative_path
+        ).read_bytes()
+
+    training_dataset = PretrainingDataset(
+        parallel_dir / "manifest.json",
+        split="train",
+        seq_len=8,
+    )
+    input_ids, target_ids = training_dataset[0]
+    assert input_ids.shape == (8,)
+    assert target_ids.shape == (8,)
+    assert input_ids.dtype == target_ids.dtype
+    assert input_ids[1:].tolist() == target_ids[:-1].tolist()
+
+
+def test_parallel_prepare_stops_logical_counts_at_the_token_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    documents = [{"text": "first document fills the budget"}]
+    documents.extend({"text": f"must not be counted {index}"} for index in range(300))
+
+    def fake_load_dataset(**kwargs: object) -> list[dict[str, str]]:
+        del kwargs
+        return documents
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+
+    manifest = prepare_streaming_dataset(
+        output_dir=tmp_path,
+        dataset_name="example/dataset",
+        text_field="text",
+        num_tokens=2,
+        shard_size=10,
+        workers=4,
+    )
+
+    assert manifest["counts"] == {
+        "tokens": 2,
+        "shards": 1,
+        "docs_seen": 1,
+        "docs_used": 1,
+        "docs_skipped": 0,
+        "docs_truncated": 1,
+    }
+
+
+def test_parallel_source_workers_download_distinct_shards_and_publish_trainable_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _WorkerDocumentDataset(["a", "b", "c", "d"])
+
+    def fake_load_dataset(**kwargs: object) -> _WorkerDocumentDataset:
+        del kwargs
+        return source
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+
+    manifest = prepare_streaming_dataset(
+        output_dir=tmp_path,
+        dataset_name="example/sharded",
+        text_field="text",
+        num_tokens=1_000,
+        shard_size=1_000,
+        workers=2,
+        source_workers=2,
+    )
+
+    encoding = tiktoken.get_encoding("gpt2")
+    token_ids = np.fromfile(tmp_path / "shard_0000.bin", dtype=np.uint16).tolist()
+    decoded_documents: list[str] = []
+    document_tokens: list[int] = []
+    for token_id in token_ids:
+        if token_id == encoding.eot_token:
+            decoded_documents.append(encoding.decode(document_tokens))
+            document_tokens = []
+        else:
+            document_tokens.append(token_id)
+    worker_pids = {
+        int(document.split()[0].removeprefix("worker=")) for document in decoded_documents
+    }
+
+    assert len(worker_pids) == 2
+    assert os.getpid() not in worker_pids
+    assert manifest["dataset"]["source_workers"] == 2
+    training_dataset = PretrainingDataset(tmp_path / "manifest.json", split="train", seq_len=4)
+    input_ids, target_ids = training_dataset[0]
+    assert input_ids[1:].tolist() == target_ids[:-1].tolist()
+
+
+def test_hugging_face_streaming_dataset_supports_parallel_source_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("datasets.config.HF_DATASETS_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        "datasets.iterable_dataset._maybe_share_with_torch_persistent_workers",
+        lambda value: value,
+    )
+    source = HuggingFaceIterableDataset.from_generator(
+        _yield_worker_documents,
+        gen_kwargs={"shards": ["a", "b", "c", "d"]},
+    )
+
+    assert isinstance(source, TorchIterableDataset)
+    assert source.num_shards == 4
+
+
+def test_parallel_prepare_ignores_a_speculative_source_failure_after_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_load_dataset(**kwargs: object) -> object:
+        del kwargs
+
+        def documents() -> Iterator[dict[str, str]]:
+            yield {"text": "this first document fills the tiny budget"}
+            raise RuntimeError("failure after sufficient data")
+
+        return documents()
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+
+    manifest = prepare_streaming_dataset(
+        output_dir=tmp_path,
+        dataset_name="example/dataset",
+        text_field="text",
+        num_tokens=2,
+        shard_size=10,
+        workers=4,
+    )
+
+    assert manifest["counts"]["tokens"] == 2
+    assert manifest["counts"]["docs_seen"] == 1
+
+
+def test_parallel_prepare_ignores_a_speculative_invalid_document_after_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_load_dataset(**kwargs: object) -> list[dict[str, str]]:
+        del kwargs
+        return [
+            {"text": "this first document fills the tiny budget"},
+            {"wrong_field": "must not invalidate completed data"},
+        ]
+
+    monkeypatch.setattr("data.prepare_data.load_dataset", fake_load_dataset)
+
+    manifest = prepare_streaming_dataset(
+        output_dir=tmp_path,
+        dataset_name="example/dataset",
+        text_field="text",
+        num_tokens=2,
+        shard_size=10,
+        workers=4,
+    )
+
+    assert manifest["counts"]["tokens"] == 2
+    assert manifest["counts"]["docs_seen"] == 1
 
 
 def test_prepare_preserves_the_source_split_without_partitioning(
@@ -660,6 +879,10 @@ def test_cli_exposes_prepare_configuration() -> None:
             "0.1",
             "--split-seed",
             "7",
+            "--workers",
+            "4",
+            "--source-workers",
+            "2",
             "--overwrite",
         ]
     )
@@ -672,6 +895,8 @@ def test_cli_exposes_prepare_configuration() -> None:
         arguments.max_docs,
         arguments.validation_ratio,
         arguments.split_seed,
+        arguments.workers,
+        arguments.source_workers,
         arguments.overwrite,
         arguments.records_field,
         arguments.record_filter,
@@ -683,6 +908,8 @@ def test_cli_exposes_prepare_configuration() -> None:
         50,
         0.1,
         7,
+        4,
+        2,
         True,
         "files",
         "language=Python,license_type=permissive",

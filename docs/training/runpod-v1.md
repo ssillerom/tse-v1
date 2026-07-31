@@ -63,9 +63,10 @@ locked dependencies. `make local-gate` must pass before paying for GPU time.
 
 ## 3. Prepare the 12B-token data
 
-Data preparation is CPU-bound and the current tokenizer path is single-process. Prefer a
-reasonably sized CPU Pod attached to the network volume rather than leaving an H100 idle.
-Run the preparation inside `tmux`:
+Data preparation is CPU-bound. On the four-vCPU Pod, the Make targets use two source processes
+to download, decompress, and decode Hugging Face shards while two tokenizer threads encode
+ordered document batches. Prefer this CPU Pod attached to the network volume rather than
+leaving an H100 idle. Run the preparation inside `tmux`:
 
 ```bash
 tmux new -s prepare-v1
@@ -74,6 +75,12 @@ make credentials-check
 make prepare-data
 make validate-recipe
 ```
+
+Override concurrency when the CPU allocation differs, for example
+`make prepare-data PREPARE_SOURCE_WORKERS=4 PREPARE_WORKERS=4`. Keep both values fixed for
+reproducibility. Tokenizer threads preserve their input order, while source processes consume
+different Hugging Face shards concurrently; `source_workers` is recorded in each new manifest
+because changing it can change which documents reach the global token budget.
 
 Detach from tmux with `Ctrl-b d` and reconnect with:
 

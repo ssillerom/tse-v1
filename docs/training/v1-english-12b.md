@@ -62,6 +62,8 @@ uv run prepare-data prepare \
   --output-dir data/pretrain-v1/fineweb-edu-sample-10bt \
   --num-tokens 10000000000 \
   --shard-size 100000000 \
+  --workers 2 \
+  --source-workers 2 \
   --validation-ratio 0.01 \
   --split-seed 42 \
   --encoding gpt2
@@ -77,6 +79,8 @@ uv run prepare-data prepare \
   --num-tokens 770000000 \
   --shard-size 100000000 \
   --min-chars 64 \
+  --workers 2 \
+  --source-workers 2 \
   --validation-ratio 0.02 \
   --split-seed 42 \
   --encoding gpt2
@@ -91,6 +95,8 @@ uv run prepare-data prepare \
   --output-dir data/pretrain-v1/nemotron-math-3 \
   --num-tokens 415000000 \
   --shard-size 100000000 \
+  --workers 2 \
+  --source-workers 2 \
   --validation-ratio 0.02 \
   --split-seed 42 \
   --encoding gpt2
@@ -104,6 +110,8 @@ uv run prepare-data prepare \
   --output-dir data/pretrain-v1/finewiki-en \
   --num-tokens 930000000 \
   --shard-size 100000000 \
+  --workers 2 \
+  --source-workers 2 \
   --validation-ratio 0.02 \
   --split-seed 42 \
   --encoding gpt2
@@ -118,6 +126,8 @@ uv run prepare-data prepare \
   --output-dir data/pretrain-v1/nemotron-math-4plus \
   --num-tokens 110000000 \
   --shard-size 100000000 \
+  --workers 2 \
+  --source-workers 2 \
   --validation-ratio 0.02 \
   --split-seed 42 \
   --encoding gpt2
@@ -131,6 +141,8 @@ uv run prepare-data prepare \
   --output-dir data/pretrain-v1/nemotron-fact-seeking \
   --num-tokens 60000000 \
   --shard-size 100000000 \
+  --workers 2 \
+  --source-workers 2 \
   --validation-ratio 0.02 \
   --split-seed 42 \
   --encoding gpt2
