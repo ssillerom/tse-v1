@@ -1108,9 +1108,9 @@ def test_cli_prepare_logs_compact_progress_and_final_stats(
     ]
     assert exit_code == 0
     assert messages[:-1] == [
-        "Progress | tokens_saved=0/6 (0.0%) | shards=0",
-        "Progress | tokens_saved=3/6 (50.0%) | shards=1",
-        "Progress | tokens_saved=6/6 (100.0%) | shards=2",
+        "Progress | tokens=2/6 (33.3%) | saved=0 | buffered=2 | shards=0",
+        "Progress | tokens=4/6 (66.7%) | saved=3 | buffered=1 | shards=1",
+        "Progress | tokens=6/6 (100.0%) | saved=6 | buffered=0 | shards=2",
         "Completed",
         "Tokens | total=6 | train=6",
         "Shards | total=2",

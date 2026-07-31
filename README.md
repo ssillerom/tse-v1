@@ -92,13 +92,14 @@ Durante `prepare`, `--log-every-docs` controla cada cuántos documentos se impri
 compacta; las barras de progreso de las librerías de origen permanecen ocultas:
 
 ```text
-Progress | tokens_saved=100,000,000/700,000,000 (14.3%) | shards=1
+Progress | tokens=148,784,753/700,000,000 (21.3%) | saved=100,000,000 | buffered=48,784,753 | shards=1
 ```
 
 Al terminar se muestran tokens totales y por split, shards, contadores de documentos, tiempo
-y throughput. Durante el progreso, `tokens_saved` y `shards` cuentan únicamente shards
-completos escritos en staging. `Completed` solo aparece después de publicar atómicamente los
-shards y el manifest en el directorio de destino.
+y throughput. Durante el progreso, `tokens` siempre equivale a `saved + buffered`: `saved` y
+`shards` cuentan shards completos escritos en staging, mientras `buffered` son tokens todavía
+en RAM. `Completed` solo aparece después de publicar atómicamente los shards y el manifest en
+el directorio de destino.
 
 La preparación nueva publica manifest v3. Cada entrada de `shards` incluye el SHA-256 del
 fichero y `load_manifest()` lo verifica además del tamaño antes de abrir los datos. Los

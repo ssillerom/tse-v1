@@ -744,13 +744,16 @@ def _prepare_into_staging_directory(
                 saved_tokens = sum(
                     shard.tokens for writer in writers.values() for shard in writer.shards
                 )
+                buffered_tokens = sum(writer.pos for writer in writers.values())
                 saved_shards = sum(len(writer.shards) for writer in writers.values())
-                percentage = saved_tokens / num_tokens * 100
+                percentage = total_tokens / num_tokens * 100
                 LOGGER.info(
-                    "Progress | tokens_saved=%s/%s (%.1f%%) | shards=%s",
-                    f"{saved_tokens:,}",
+                    "Progress | tokens=%s/%s (%.1f%%) | saved=%s | buffered=%s | shards=%s",
+                    f"{total_tokens:,}",
                     f"{num_tokens:,}",
                     percentage,
+                    f"{saved_tokens:,}",
+                    f"{buffered_tokens:,}",
                     f"{saved_shards:,}",
                 )
                 next_log_at += log_every_docs
