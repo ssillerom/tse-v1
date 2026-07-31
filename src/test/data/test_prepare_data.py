@@ -4,6 +4,8 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import tiktoken
 from datasets import IterableDataset as HuggingFaceIterableDataset
@@ -34,6 +36,20 @@ class _WorkerDocumentDataset(TorchDataset[dict[str, str]]):
 
     def __getitem__(self, index: int) -> dict[str, str]:
         return {"text": f"worker={os.getpid()} shard={self.shards[index]}"}
+
+
+def _decode_shard_documents(shard_path: Path) -> list[str]:
+    encoding = tiktoken.get_encoding("gpt2")
+    token_ids = np.fromfile(shard_path, dtype=np.uint16).tolist()
+    documents: list[str] = []
+    document_tokens: list[int] = []
+    for token_id in token_ids:
+        if token_id == encoding.eot_token:
+            documents.append(encoding.decode(document_tokens))
+            document_tokens = []
+        else:
+            document_tokens.append(token_id)
+    return documents
 
 
 def test_writer_rejects_non_positive_shard_size(tmp_path: Path) -> None:
@@ -153,6 +169,7 @@ def test_inspection_forwards_data_dir_to_hugging_face(
         ("log_every_docs", 0, "log_every_docs must be positive"),
         ("workers", 0, "workers must be positive"),
         ("source_workers", -1, "source_workers cannot be negative"),
+        ("source_reader", "unknown", "source_reader must be one of"),
         ("max_docs", 0, "max_docs must be positive"),
         (
             "validation_ratio",
@@ -170,7 +187,7 @@ def test_prepare_rejects_invalid_limits_before_loading_the_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     invalid_argument: str,
-    invalid_value: int | float,
+    invalid_value: int | float | str,
     message: str,
 ) -> None:
     def fail_if_called(**kwargs: object) -> tuple[()]:
@@ -374,19 +391,114 @@ def test_prepare_can_flatten_and_filter_nested_source_records(
     assert manifest["counts"]["docs_seen"] == 2
     assert manifest["counts"]["docs_used"] == 2
 
-    encoding = tiktoken.get_encoding("gpt2")
-    token_ids = np.fromfile(tmp_path / "shard_0000.bin", dtype=np.uint16).tolist()
-    documents: list[str] = []
-    document_tokens: list[int] = []
-    for token_id in token_ids:
-        if token_id == encoding.eot_token:
-            documents.append(encoding.decode(document_tokens))
-            document_tokens = []
-        else:
-            document_tokens.append(token_id)
-    assert documents == [
+    assert _decode_shard_documents(tmp_path / "shard_0000.bin") == [
         "def add(a, b):\n    return a + b\n",
         "print(add(2, 3))\n",
+    ]
+
+
+def test_prepare_reads_nested_parquet_with_duckdb_and_publishes_trainable_data(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "stack.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "repo_path": "example/project",
+                    "files": [
+                        {
+                            "language": "Python",
+                            "license_type": "permissive",
+                            "content": "def add(a, b):\n    return a + b\n",
+                        },
+                        {
+                            "language": "JavaScript",
+                            "license_type": "permissive",
+                            "content": "const add = (a, b) => a + b;\n",
+                        },
+                        {
+                            "language": "Python",
+                            "license_type": "permissive",
+                            "content": "print(add(2, 3))\n",
+                        },
+                    ],
+                }
+            ]
+        ),
+        source_path,
+    )
+    output_dir = tmp_path / "prepared"
+
+    manifest = prepare_streaming_dataset(
+        output_dir=output_dir,
+        dataset_name=str(source_path),
+        source_reader="duckdb",
+        records_field="files",
+        record_filter="language=Python,license_type=permissive",
+        text_field="content",
+        num_tokens=1_000,
+        shard_size=1_000,
+    )
+
+    assert manifest["dataset"]["source_reader"] == "duckdb"
+    assert _decode_shard_documents(output_dir / "shard_0000.bin") == [
+        "def add(a, b):\n    return a + b\n",
+        "print(add(2, 3))\n",
+    ]
+
+    training_dataset = PretrainingDataset(
+        output_dir / "manifest.json",
+        split="train",
+        seq_len=8,
+    )
+    input_ids, target_ids = training_dataset[0]
+    assert input_ids.shape == target_ids.shape == (8,)
+    assert input_ids[1:].tolist() == target_ids[:-1].tolist()
+
+
+def test_duckdb_source_reads_multiple_parquet_files_in_filename_order(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "parquet"
+    source_dir.mkdir()
+    for filename, content in (
+        ("part-00001.parquet", "second document"),
+        ("part-00000.parquet", "first document"),
+    ):
+        pq.write_table(
+            pa.Table.from_pylist(
+                [
+                    {
+                        "files": [
+                            {
+                                "language": "Python",
+                                "license_type": "permissive",
+                                "content": content,
+                            }
+                        ]
+                    }
+                ]
+            ),
+            source_dir / filename,
+        )
+    output_dir = tmp_path / "prepared"
+
+    prepare_streaming_dataset(
+        output_dir=output_dir,
+        dataset_name=str(source_dir),
+        source_reader="duckdb",
+        records_field="files",
+        record_filter="language=Python,license_type=permissive",
+        text_field="content",
+        num_tokens=1_000,
+        shard_size=1_000,
+        source_workers=2,
+    )
+
+    assert _decode_shard_documents(output_dir / "shard_0000.bin") == [
+        "first document",
+        "second document",
     ]
 
 
@@ -419,6 +531,19 @@ def test_prepare_rejects_a_malformed_nested_record_filter(tmp_path: Path) -> Non
             records_field="files",
             record_filter="language=Python,",
             text_field="content",
+            num_tokens=100,
+            shard_size=100,
+        )
+
+
+def test_duckdb_source_rejects_non_train_splits_before_remote_access(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="only supports split='train'"):
+        prepare_streaming_dataset(
+            output_dir=tmp_path,
+            dataset_name="example/dataset",
+            source_reader="duckdb",
+            split="validation",
+            text_field="text",
             num_tokens=100,
             shard_size=100,
         )
@@ -572,16 +697,7 @@ def test_parallel_source_workers_download_distinct_shards_and_publish_trainable_
         source_workers=2,
     )
 
-    encoding = tiktoken.get_encoding("gpt2")
-    token_ids = np.fromfile(tmp_path / "shard_0000.bin", dtype=np.uint16).tolist()
-    decoded_documents: list[str] = []
-    document_tokens: list[int] = []
-    for token_id in token_ids:
-        if token_id == encoding.eot_token:
-            decoded_documents.append(encoding.decode(document_tokens))
-            document_tokens = []
-        else:
-            document_tokens.append(token_id)
+    decoded_documents = _decode_shard_documents(tmp_path / "shard_0000.bin")
     worker_pids = {
         int(document.split()[0].removeprefix("worker=")) for document in decoded_documents
     }
@@ -883,6 +999,8 @@ def test_cli_exposes_prepare_configuration() -> None:
             "4",
             "--source-workers",
             "2",
+            "--source-reader",
+            "duckdb",
             "--overwrite",
         ]
     )
@@ -897,6 +1015,7 @@ def test_cli_exposes_prepare_configuration() -> None:
         arguments.split_seed,
         arguments.workers,
         arguments.source_workers,
+        arguments.source_reader,
         arguments.overwrite,
         arguments.records_field,
         arguments.record_filter,
@@ -910,6 +1029,7 @@ def test_cli_exposes_prepare_configuration() -> None:
         7,
         4,
         2,
+        "duckdb",
         True,
         "files",
         "language=Python,license_type=permissive",

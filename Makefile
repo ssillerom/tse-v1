@@ -163,6 +163,7 @@ $(STACK_MANIFEST):
 		--min-chars 64 \
 		--workers $(PREPARE_WORKERS) \
 		--source-workers $(PREPARE_SOURCE_WORKERS) \
+		--source-reader duckdb \
 		--validation-ratio 0.02 \
 		--split-seed $(SPLIT_SEED) \
 		--encoding gpt2

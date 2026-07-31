@@ -82,6 +82,12 @@ descompresión y decodificación. Para una preparación reproducible hay que fij
 el número de procesos de origen queda registrado en el manifest porque puede cambiar el orden
 en que los shards de Hugging Face alcanzan el límite global de tokens.
 
+Stack v3 usa `--source-reader duckdb` porque sus filas contienen listas anidadas de archivos
+que pueden exceder la capacidad del lector Parquet de PyArrow. Este lector descarga
+anticipadamente hasta `--source-workers` Parquet, los procesa en orden de nombre y elimina
+cada copia temporal al terminarla. DuckDB entrega un archivo de código por fila; la
+tokenización y el formato de salida son los mismos que con el lector predeterminado.
+
 La preparación nueva publica manifest v3. Cada entrada de `shards` incluye el SHA-256 del
 fichero y `load_manifest()` lo verifica además del tamaño antes de abrir los datos. Los
 manifest v2 existentes siguen siendo legibles, pero no ofrecen esta comprobación porque

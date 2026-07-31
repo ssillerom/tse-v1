@@ -14,14 +14,17 @@ import shutil
 import tempfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from typing import cast
 
+import duckdb
 import numpy as np
 import tiktoken
 from datasets import load_dataset  # type: ignore[import-untyped]
+from huggingface_hub import HfApi, hf_hub_download
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset as TorchDataset
 
@@ -33,6 +36,8 @@ SHARD_FILENAME_PATTERN = re.compile(r"shard_\d{4,}\.bin(?:\.tmp)?\Z")
 GENERATED_DIRECTORY_NAMES = frozenset({"train", "validation"})
 TOKENIZATION_BATCH_MAX_DOCS = 256
 TOKENIZATION_BATCH_MAX_CHARS = 4_000_000
+DUCKDB_BATCH_SIZE = 256
+SOURCE_READERS = frozenset({"hugging_face", "duckdb"})
 
 
 def _find_generated_artifacts(output_dir: Path) -> list[Path]:
@@ -63,6 +68,16 @@ class ShardMetadata:
     file: str
     tokens: int
     sha256: str
+
+
+@dataclass(frozen=True)
+class DuckDBParquetSource:
+    """Ordered local files or files pinned to one Hugging Face dataset revision."""
+
+    files: tuple[str, ...]
+    repo_id: str | None = None
+    revision: str | None = None
+    hf_token: bool = False
 
 
 class TokenShardWriter:
@@ -186,6 +201,177 @@ def load_streaming_hf_dataset(
         kwargs["token"] = True
 
     return cast(Iterable[Mapping[str, object]], load_dataset(**kwargs))
+
+
+def _duckdb_parquet_files(
+    dataset_name: str,
+    data_dir: str | None,
+    revision: str | None,
+    hf_token: bool,
+) -> DuckDBParquetSource:
+    local_path = Path(dataset_name)
+    if local_path.is_file():
+        return DuckDBParquetSource(files=(str(local_path),))
+    if local_path.is_dir():
+        local_parquet_directory = local_path / data_dir if data_dir is not None else local_path
+        parquet_paths = tuple(
+            str(path) for path in sorted(local_parquet_directory.glob("*.parquet"))
+        )
+        if not parquet_paths:
+            raise FileNotFoundError(f"no Parquet files found in {local_parquet_directory}")
+        return DuckDBParquetSource(files=parquet_paths)
+
+    remote_parquet_directory = data_dir or "data"
+    prefix = f"{remote_parquet_directory.rstrip('/')}/"
+    api = HfApi(token=True if hf_token else None)
+    parquet_paths = tuple(
+        sorted(
+            path
+            for path in api.list_repo_files(
+                repo_id=dataset_name,
+                repo_type="dataset",
+                revision=revision,
+            )
+            if path.startswith(prefix) and path.endswith(".parquet")
+        )
+    )
+    if not parquet_paths:
+        raise FileNotFoundError(
+            f"no Parquet files found for {dataset_name!r} in {remote_parquet_directory!r}"
+        )
+    return DuckDBParquetSource(
+        files=parquet_paths,
+        repo_id=dataset_name,
+        revision=revision,
+        hf_token=hf_token,
+    )
+
+
+def _download_duckdb_parquet_file(
+    source: DuckDBParquetSource,
+    filename: str,
+    local_dir: Path,
+) -> str:
+    if source.repo_id is None:
+        return filename
+    return hf_hub_download(
+        repo_id=source.repo_id,
+        filename=filename,
+        repo_type="dataset",
+        revision=source.revision,
+        token=True if source.hf_token else None,
+        local_dir=local_dir,
+    )
+
+
+def _materialize_duckdb_parquet_files(
+    source: DuckDBParquetSource,
+    workers: int,
+) -> Iterable[str]:
+    if source.repo_id is None:
+        yield from source.files
+        return
+
+    with tempfile.TemporaryDirectory(prefix="prepare-data-duckdb-") as temporary_name:
+        temporary_root = Path(temporary_name)
+        next_index = 0
+        pending: list[tuple[int, Future[str]]] = []
+        executor = ThreadPoolExecutor(max_workers=workers)
+
+        def submit(index: int) -> tuple[int, Future[str]]:
+            local_dir = temporary_root / f"{index:08d}"
+            return (
+                index,
+                executor.submit(
+                    _download_duckdb_parquet_file,
+                    source,
+                    source.files[index],
+                    local_dir,
+                ),
+            )
+
+        try:
+            while next_index < min(workers, len(source.files)):
+                pending.append(submit(next_index))
+                next_index += 1
+
+            while pending:
+                index, future = pending.pop(0)
+                try:
+                    yield future.result()
+                finally:
+                    shutil.rmtree(temporary_root / f"{index:08d}", ignore_errors=True)
+
+                if next_index < len(source.files):
+                    pending.append(submit(next_index))
+                    next_index += 1
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _quote_duckdb_identifier(identifier: str) -> str:
+    return f'"{identifier.replace('"', '""')}"'
+
+
+def load_streaming_duckdb_dataset(
+    dataset_name: str,
+    text_field: str,
+    records_field: str | None,
+    record_filters: Sequence[tuple[str, str]],
+    data_dir: str | None = None,
+    revision: str | None = None,
+    hf_token: bool = False,
+    threads: int = 1,
+) -> Iterable[Mapping[str, object]]:
+    """Read Parquet records through DuckDB without materializing nested Arrow arrays."""
+    source = _duckdb_parquet_files(
+        dataset_name=dataset_name,
+        data_dir=data_dir,
+        revision=revision,
+        hf_token=hf_token,
+    )
+
+    def documents() -> Iterable[Mapping[str, object]]:
+        connection = duckdb.connect()
+        try:
+            connection.execute(f"SET threads = {threads}")
+            connection.execute("SET preserve_insertion_order = true")
+            connection.execute("SET enable_progress_bar = false")
+
+            quoted_text_field = _quote_duckdb_identifier(text_field)
+            parameters = [value for _, value in record_filters]
+            for parquet_file in _materialize_duckdb_parquet_files(source, workers=threads):
+                connection.from_parquet(parquet_file).create_view(
+                    "__prepare_data_source",
+                    replace=True,
+                )
+                if records_field is None:
+                    query = f'SELECT {quoted_text_field} FROM "__prepare_data_source"'
+                else:
+                    quoted_records_field = _quote_duckdb_identifier(records_field)
+                    record_column = _quote_duckdb_identifier("__record")
+                    filters = " AND ".join(
+                        f"{record_column}.{_quote_duckdb_identifier(field)} = ?"
+                        for field, _ in record_filters
+                    )
+                    where_clause = f" WHERE {filters}" if filters else ""
+                    query = (
+                        f"SELECT {record_column}.{quoted_text_field} AS {quoted_text_field} "
+                        f"FROM (SELECT unnest({quoted_records_field}) AS {record_column} "
+                        'FROM "__prepare_data_source") '
+                        f"{where_clause}"
+                    )
+
+                reader = connection.sql(query, params=parameters).to_arrow_reader(
+                    batch_size=DUCKDB_BATCH_SIZE
+                )
+                for batch in reader:
+                    for value in batch.column(0).to_pylist():
+                        yield {text_field: value}
+        finally:
+            connection.close()
+
+    return documents()
 
 
 def _parse_record_filter(
@@ -325,6 +511,7 @@ def _validate_preparation_limits(
     log_every_docs: int,
     workers: int,
     source_workers: int,
+    source_reader: str,
     max_docs: int | None,
     validation_ratio: float,
 ) -> None:
@@ -340,6 +527,9 @@ def _validate_preparation_limits(
         raise ValueError("workers must be positive")
     if source_workers < 0:
         raise ValueError("source_workers cannot be negative")
+    if source_reader not in SOURCE_READERS:
+        choices = ", ".join(sorted(SOURCE_READERS))
+        raise ValueError(f"source_reader must be one of: {choices}")
     if max_docs is not None and max_docs <= 0:
         raise ValueError("max_docs must be positive")
     if not 0.0 <= validation_ratio < 1.0:
@@ -650,6 +840,7 @@ def prepare_streaming_dataset(
     log_every_docs: int = 10_000,
     workers: int = 1,
     source_workers: int = 0,
+    source_reader: str = "hugging_face",
     max_docs: int | None = None,
     validation_ratio: float = 0.0,
     split_seed: int = 42,
@@ -666,6 +857,7 @@ def prepare_streaming_dataset(
         log_every_docs,
         workers,
         source_workers,
+        source_reader,
         max_docs,
         validation_ratio,
     )
@@ -674,6 +866,11 @@ def prepare_streaming_dataset(
     if records_field is None and record_filter is not None:
         raise ValueError("record_filter requires records_field")
     parsed_record_filter = _parse_record_filter(record_filter)
+    if source_reader == "duckdb":
+        if split != "train":
+            raise ValueError("source_reader='duckdb' only supports split='train'")
+        if name is not None:
+            raise ValueError("source_reader='duckdb' does not support dataset configs")
 
     encoding = tiktoken.get_encoding(encoding_name)
     if encoding.max_token_value > UINT16_MAX:
@@ -691,22 +888,34 @@ def prepare_streaming_dataset(
             "Pass overwrite=True only if replacing them is intentional."
         )
 
-    source_dataset = load_streaming_hf_dataset(
-        dataset_name=dataset_name,
-        split=split,
-        name=name,
-        data_dir=data_dir,
-        revision=revision,
-        hf_token=hf_token,
-    )
-    dataset = _iter_source_documents(
-        dataset=_parallel_source_documents(
-            dataset=source_dataset,
-            source_workers=source_workers,
-        ),
-        records_field=records_field,
-        record_filters=parsed_record_filter,
-    )
+    if source_reader == "duckdb":
+        dataset = load_streaming_duckdb_dataset(
+            dataset_name=dataset_name,
+            text_field=text_field,
+            records_field=records_field,
+            record_filters=parsed_record_filter,
+            data_dir=data_dir,
+            revision=revision,
+            hf_token=hf_token,
+            threads=max(1, source_workers),
+        )
+    else:
+        source_dataset = load_streaming_hf_dataset(
+            dataset_name=dataset_name,
+            split=split,
+            name=name,
+            data_dir=data_dir,
+            revision=revision,
+            hf_token=hf_token,
+        )
+        dataset = _iter_source_documents(
+            dataset=_parallel_source_documents(
+                dataset=source_dataset,
+                source_workers=source_workers,
+            ),
+            records_field=records_field,
+            record_filters=parsed_record_filter,
+        )
     dataset_manifest: dict[str, object] = {
         "path": dataset_name,
         "name": name,
@@ -718,6 +927,8 @@ def prepare_streaming_dataset(
     if records_field is not None:
         dataset_manifest["records_field"] = records_field
         dataset_manifest["record_filter"] = record_filter
+    if source_reader != "hugging_face":
+        dataset_manifest["source_reader"] = source_reader
     if source_workers > 0:
         dataset_manifest["source_workers"] = source_workers
 
@@ -726,24 +937,29 @@ def prepare_streaming_dataset(
         dir=output_path,
     ) as staging_name:
         staging_path = Path(staging_name)
-        manifest = _prepare_into_staging_directory(
-            staging_dir=staging_path,
-            destination_dir=output_path,
-            dataset=dataset,
-            dataset_manifest=dataset_manifest,
-            source_split=split,
-            text_field=text_field,
-            num_tokens=num_tokens,
-            shard_size=shard_size,
-            min_chars=min_chars,
-            log_every_docs=log_every_docs,
-            workers=workers,
-            max_docs=max_docs,
-            validation_ratio=validation_ratio,
-            split_seed=split_seed,
-            encoding=encoding,
-            encoding_name=encoding_name,
-        )
+        try:
+            manifest = _prepare_into_staging_directory(
+                staging_dir=staging_path,
+                destination_dir=output_path,
+                dataset=dataset,
+                dataset_manifest=dataset_manifest,
+                source_split=split,
+                text_field=text_field,
+                num_tokens=num_tokens,
+                shard_size=shard_size,
+                min_chars=min_chars,
+                log_every_docs=log_every_docs,
+                workers=workers,
+                max_docs=max_docs,
+                validation_ratio=validation_ratio,
+                split_seed=split_seed,
+                encoding=encoding,
+                encoding_name=encoding_name,
+            )
+        finally:
+            close_dataset = getattr(dataset, "close", None)
+            if callable(close_dataset):
+                close_dataset()
         _install_staged_artifacts(staging_path, output_path)
 
     return manifest
@@ -797,6 +1013,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Number of processes used to download and decode source shards",
+    )
+    prepare_parser.add_argument(
+        "--source-reader",
+        choices=sorted(SOURCE_READERS),
+        default="hugging_face",
+        help="Reader used for source data; duckdb avoids materializing nested Arrow arrays",
     )
     prepare_parser.add_argument(
         "--max-docs",
@@ -862,6 +1084,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log_every_docs=args.log_every_docs,
         workers=args.workers,
         source_workers=args.source_workers,
+        source_reader=args.source_reader,
         max_docs=args.max_docs,
         validation_ratio=args.validation_ratio,
         split_seed=args.split_seed,

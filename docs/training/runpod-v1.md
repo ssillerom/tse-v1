@@ -63,10 +63,12 @@ locked dependencies. `make local-gate` must pass before paying for GPU time.
 
 ## 3. Prepare the 12B-token data
 
-Data preparation is CPU-bound. On the four-vCPU Pod, the Make targets use two source processes
-to download, decompress, and decode Hugging Face shards while two tokenizer threads encode
-ordered document batches. Prefer this CPU Pod attached to the network volume rather than
-leaving an H100 idle. Run the preparation inside `tmux`:
+Data preparation is CPU-bound. On the four-vCPU Pod, the Make targets use two source workers
+to overlap Hugging Face downloads while two tokenizer threads encode ordered document
+batches. The Stack v3 target uses DuckDB: it prefetches at most two Parquet files to temporary
+container storage, processes them in filename order, and deletes each copy after use. Keep at
+least 5 GB of free temporary disk for this bounded prefetch. Prefer this CPU Pod attached to
+the network volume rather than leaving an H100 idle. Run the preparation inside `tmux`:
 
 ```bash
 tmux new -s prepare-v1
@@ -79,7 +81,8 @@ make validate-recipe
 Override concurrency when the CPU allocation differs, for example
 `make prepare-data PREPARE_SOURCE_WORKERS=4 PREPARE_WORKERS=4`. Keep both values fixed for
 reproducibility. Tokenizer threads preserve their input order, while source processes consume
-different Hugging Face shards concurrently; `source_workers` is recorded in each new manifest
+different Hugging Face shards concurrently. For DuckDB sources the same setting controls
+ordered Parquet prefetch and DuckDB threads. `source_workers` is recorded in each new manifest
 because changing it can change which documents reach the global token budget.
 
 Detach from tmux with `Ctrl-b d` and reconnect with:
@@ -97,6 +100,21 @@ its exact path, then rerun its individual target.
 `make validate-recipe` verifies every manifest v3 SHA-256. Run it after preparation and again
 after transferring or restoring the network volume; the sequential reads are intentional and
 should happen before renting the final H100.
+
+The regression proof for the original oversized Stack v3 row group is opt-in so the default
+test suite never downloads data. To repeat it, download the pinned shard and point the test at
+the resulting local file:
+
+```bash
+hf download HuggingFaceCode/stack-v3-train \
+  data/part-00066-50e95205-4aec-46cc-bde2-02f09aa216ac-c000.snappy.parquet \
+  --repo-type dataset \
+  --revision 2b4797afd5677e32630c2247a6a8092e1a5afa03 \
+  --local-dir /tmp/stack-v3-regression
+
+STACK_V3_SHARD_66_PATH=/tmp/stack-v3-regression/data/part-00066-50e95205-4aec-46cc-bde2-02f09aa216ac-c000.snappy.parquet \
+  uv run pytest -q src/integration_tests/test_stack_v3_duckdb.py
+```
 
 Before terminating the CPU Pod, verify that the six manifests exist and preserve the network
 volume:

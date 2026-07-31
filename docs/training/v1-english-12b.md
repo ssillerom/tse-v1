@@ -81,6 +81,7 @@ uv run prepare-data prepare \
   --min-chars 64 \
   --workers 2 \
   --source-workers 2 \
+  --source-reader duckdb \
   --validation-ratio 0.02 \
   --split-seed 42 \
   --encoding gpt2
@@ -150,8 +151,11 @@ uv run prepare-data prepare \
 
 Stack v3 stores one repository per row and the source files in `files[].content`; it has no
 per-language configuration. The nested-record options above flatten those files and apply
-both filters. This deliberately keeps only Python files labelled `permissive`, although the
-dataset license and each original source license still need to be respected. The FineWeb-Edu
+both filters. Its DuckDB reader downloads at most `source_workers` Parquet files ahead,
+processes them in filename order, and removes each temporary file after use. This avoids
+materializing the oversized nested Arrow arrays in the original Parquet row groups. It
+deliberately keeps only Python files labelled `permissive`, although the dataset license and
+each original source license still need to be respected. The FineWeb-Edu
 sample is prepared once: the deterministic sampler counts prior uses of a source, so its
 decay slice starts after the 8.75B stable-token quota instead of replaying the beginning.
 Nemotron Math publishes configs `3`, `4plus`, and `4plus_MIND`; its card defines “3plus” as
