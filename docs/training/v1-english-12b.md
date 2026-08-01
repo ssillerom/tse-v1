@@ -330,7 +330,9 @@ uv run train-v1 \
 Watch the first 100 steps live before leaving the job unattended. At step 1,000, verify the
 saved checkpoint on the same H100 with `--resume latest`; continuing the same run is preferable
 to starting over. If micro-batch 16 does not fit, use 8 × 64. This preserves the global batch,
-number of optimizer steps and schedule.
+number of optimizer steps and schedule. The final segment boundary is evaluated even though
+22,888 is not divisible by 500; compare `best_validation.pt` with the final numbered checkpoint
+before running the post-hoc suite.
 
 After the final checkpoint, follow
 [`docs/training/evaluation.md`](evaluation.md) for the fixed benchmark suite and the

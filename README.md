@@ -148,8 +148,11 @@ uv run train-v1 \
 ```
 
 Los prompts son fijos durante toda la ejecución para poder comparar checkpoints sin introducir
-azar de sampling. La evaluación frecuente usa como máximo `--eval-batches 20`; el checkpoint
-final se guarda incluso si el último step no coincide con el intervalo. `--precision auto`
+azar de sampling. La evaluación frecuente usa como máximo `--eval-batches 20`, seleccionados
+de forma determinista y equidistante a lo largo de todo el split; no evalúa sólo su comienzo.
+También evalúa el último step de cada segmento aunque no coincida con el intervalo. La
+evaluación preserva el RNG global, por lo que observar el modelo no cambia futuros masks de
+dropout ni seeds de workers. `--precision auto`
 selecciona autocast BF16 cuando CUDA y la GPU lo soportan, y FP32 en los demás casos. El modelo
 y los estados de AdamW se mantienen en FP32; BF16 reduce el coste de las operaciones del
 forward y backward.
@@ -159,8 +162,10 @@ además de un agregado ponderado con las proporciones completas de la recipe. `t
 está disponible de forma opcional en CUDA mediante `--compile`; debe compararse contra eager
 en un rehearsal y conservarse idéntico al reanudar.
 
-Por defecto se conservan sólo los tres checkpoints con mayor step. Para continuar el mismo
-entrenamiento y la misma ejecución de W&B, usa el directorio y la configuración originales:
+Por defecto se conservan sólo los tres checkpoints numerados con mayor step. Además,
+`best_validation.pt` conserva siempre las ponderaciones con menor `validation/loss`; no está
+sujeto a esa retención. Para continuar el mismo entrenamiento y la misma ejecución de W&B, usa
+el directorio y la configuración originales:
 
 ```bash
 uv run train-v1 \
@@ -177,20 +182,22 @@ la identidad completa de W&B (entity, proyecto e identificador). Al reanudar exi
 ya exista, en vez de crear silenciosamente uno nuevo. Antes de continuar también valida el
 contrato de datos (manifest o receta), seed, batch size y los hiperparámetros de AdamW que
 determinan la posición de datos y la siguiente actualización. La
-evaluación y las muestras realizadas al abrir el run preservan el RNG restaurado. Como el
+evaluación periódica y las muestras realizadas al abrir el run preservan el RNG restaurado.
+Los checkpoints v6 guardan tanto su propia loss de validación como la mejor observada, de modo
+que una reanudación no puede reemplazar `best_validation.pt` por un modelo peor. Como el
 learning-rate schedule es una función del step y de la configuración guardada, no necesita un
 objeto de scheduler separado.
 
 En runs con receta, el checkpoint también conserva el presupuesto configurado y los tokens
 realmente consumidos por cada fuente; la trazabilidad de la mezcla no depende de W&B.
 
-Los checkpoints antiguos de formato v1 todavía se pueden abrir. Como no guardaban el hash del
+Los checkpoints antiguos, incluido el formato v1, todavía se pueden abrir. Como v1 no guardaba el hash del
 manifest, el batch size ni la configuración exacta del optimizador, la carga avisa de que no
 puede verificar esos datos antes de continuar.
 
 Cada experimento debe usar un `--checkpoint-dir` exclusivo: la retención se aplica a todos los
-archivos `step_*.pt` de ese directorio. Esto evita mezclar estados pertenecientes a runs
-distintos.
+archivos `step_*.pt` de ese directorio y nunca a `best_validation.pt`. Esto evita mezclar
+estados pertenecientes a runs distintos.
 
 Para probar el flujo completo sin iniciar sesión ni acceder a la red:
 

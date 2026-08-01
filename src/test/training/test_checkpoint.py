@@ -128,6 +128,8 @@ def test_checkpoint_restores_the_wandb_run_identity(tmp_path: Path) -> None:
         wandb_entity="research-team",
         data_position=64,
         tokens_seen=384,
+        validation_loss=1.25,
+        best_validation_loss=1.0,
     )
 
     restored = restore_checkpoint(
@@ -144,6 +146,8 @@ def test_checkpoint_restores_the_wandb_run_identity(tmp_path: Path) -> None:
     assert restored.wandb_entity == "research-team"
     assert restored.data_position == 64
     assert restored.tokens_seen == 384
+    assert restored.validation_loss == pytest.approx(1.25)
+    assert restored.best_validation_loss == pytest.approx(1.0)
 
 
 def test_checkpoint_retention_keeps_only_the_newest_files(tmp_path: Path) -> None:

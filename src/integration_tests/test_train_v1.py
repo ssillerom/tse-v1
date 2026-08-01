@@ -152,6 +152,13 @@ def test_train_v1_runs_evaluation_generation_and_checkpointing_offline(
     assert checkpoint_path.is_file()
     checkpoint = torch.load(checkpoint_path, weights_only=True)
     assert checkpoint["training_config"]["precision"] == "bf16"
+    best_checkpoint = torch.load(checkpoint_dir / "best_validation.pt", weights_only=True)
+    assert best_checkpoint["validation_loss"] == pytest.approx(
+        best_checkpoint["best_validation_loss"]
+    )
+    assert checkpoint["best_validation_loss"] == pytest.approx(
+        best_checkpoint["best_validation_loss"]
+    )
 
 
 def test_train_v1_rejects_torch_compile_without_cuda(tmp_path: Path) -> None:

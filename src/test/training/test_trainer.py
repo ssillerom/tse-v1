@@ -330,6 +330,21 @@ def test_evaluate_returns_loss_without_gradients_and_restores_training_mode() ->
     assert all(parameter.grad is None for parameter in model.parameters())
 
 
+def test_evaluate_preserves_torch_rng_when_iterating_a_dataloader() -> None:
+    model = _tiny_model(dropout=0.2)
+    batch = (
+        torch.tensor([[0, 1, 2, 3, 4, 5]]),
+        torch.tensor([[1, 2, 3, 4, 5, 6]]),
+    )
+    loader = DataLoader(TensorDataset(*batch), batch_size=1, shuffle=False)
+    torch.manual_seed(42)
+    rng_state_before = torch.get_rng_state().clone()
+
+    evaluate(model=model, batches=loader, device="cpu")
+
+    torch.testing.assert_close(torch.get_rng_state(), rng_state_before, rtol=0.0, atol=0.0)
+
+
 def test_evaluate_runs_the_forward_pass_under_bf16_autocast() -> None:
     model = AutocastRecordingGPT()
     batch = (
@@ -477,8 +492,8 @@ def test_train_runs_accumulated_steps_with_scheduling_and_evaluation() -> None:
     assert history[1].validation_loss is not None
     assert history[0].validation_perplexity is None
     assert history[1].validation_perplexity == pytest.approx(math.exp(history[1].validation_loss))
-    assert history[2].validation_perplexity is None
-    assert history[2].validation_loss is None
+    assert history[2].validation_loss is not None
+    assert history[2].validation_perplexity == pytest.approx(math.exp(history[2].validation_loss))
     assert all(math.isfinite(metrics.loss) for metrics in history)
     assert all(math.isfinite(metrics.gradient_norm) for metrics in history)
     assert [metrics.tokens_in_step for metrics in history] == [24, 24, 24]
@@ -512,6 +527,28 @@ def test_train_reports_scheduled_validation_for_every_recipe_domain() -> None:
     assert set(history[0].validation_domains) == {"web", "math"}
     assert history[0].validation_domains["web"].target_tokens == 6
     assert history[0].validation_domains["math"].target_tokens == 6
+
+
+def test_train_evaluates_the_last_step_of_a_segment_between_intervals() -> None:
+    model = _tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    batch = (
+        torch.tensor([[0, 1, 2, 3, 4, 5]]),
+        torch.tensor([[1, 2, 3, 4, 5, 6]]),
+    )
+
+    history = train(
+        model=model,
+        optimizer=optimizer,
+        train_batches=[batch],
+        config=TrainingConfig(max_steps=3, eval_interval=2, eval_batches=1),
+        device="cpu",
+        validation_batches=[batch],
+        end_step=1,
+    )
+
+    assert history[-1].step == 1
+    assert history[-1].validation_loss is not None
 
 
 def test_train_can_resume_from_an_already_positioned_batch_source() -> None:

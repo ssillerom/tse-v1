@@ -5,8 +5,8 @@ not be collapsed into one number.
 
 ## 1. Validation during pretraining
 
-Every source in a multi-source recipe has its own fixed `validation` split. At step zero and
-every `--eval-interval`, the trainer reports:
+Every source in a multi-source recipe has its own fixed `validation` split. At step zero,
+every `--eval-interval`, and the final step of each executed segment, the trainer reports:
 
 - `validation/<source>/loss`;
 - `validation/<source>/perplexity`;
@@ -17,8 +17,16 @@ proportions. `validation/perplexity` is the exponential of that aggregate loss. 
 is convenient for checkpoint selection, but source metrics are the diagnostic evidence: a
 lower global loss must not hide regression on mathematics, code, or knowledge.
 
-`--eval-batches` is applied independently to every source. Keep the manifests, sequence
-length, tokenizer, batch limit, and recipe unchanged when comparing runs.
+`--eval-batches` is applied independently to every source. Its fixed windows are selected at
+even intervals across the complete split, including both ends when more than one window is
+requested. Validation restores the caller's PyTorch RNG state after every pass, so changing
+the evaluation schedule cannot change later dropout masks or data-worker seeds. Keep the
+manifests, sequence length, tokenizer, batch limit, and recipe unchanged when comparing runs.
+
+`best_validation.pt` is atomically replaced only when the aggregate validation loss improves.
+Numbered `step_*.pt` files remain the resumable chronology and follow `--keep-last-checkpoints`;
+the best checkpoint is retained independently. Each v6 checkpoint stores both the loss of its
+own weights, when evaluated, and the best loss observed so far so selection survives resume.
 
 ## 2. Controlled data-mixture baseline
 

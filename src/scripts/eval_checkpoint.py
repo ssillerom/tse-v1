@@ -1,4 +1,9 @@
-"""Evaluate one custom GPT checkpoint with EleutherAI's benchmark harness."""
+"""Evaluate one GPT checkpoint and publish a reproducible benchmark artifact.
+
+The script reconstructs the raw model from its checkpoint, adapts it to the
+EleutherAI harness, then atomically writes results together with enough model,
+tokenizer, dependency, and Git metadata to identify the exact evaluation.
+"""
 
 import argparse
 import hashlib
@@ -166,6 +171,8 @@ def main(
         batch_size=arguments.batch_size,
         precision=precision,
     )
+    # The harness owns task prompts and metric definitions; the adapter owns
+    # only tokenization, model scoring, and greedy generation.
     raw_results = runtime.simple_evaluate(
         model=adapter,
         tasks=list(tasks),
@@ -177,6 +184,8 @@ def main(
     if not isinstance(raw_results, dict):
         raise RuntimeError("lm-evaluation-harness returned no result dictionary")
 
+    # Keep provenance beside the raw harness payload rather than depending on
+    # a mutable W&B run or the checkpoint filename alone.
     artifact: dict[str, Any] = {
         "format_version": 1,
         "created_at": datetime.now(UTC).isoformat(),
@@ -213,6 +222,8 @@ def main(
         sort_keys=True,
         default=runtime.handle_non_serializable,
     )
+    # Publish only a complete JSON document. A crash can leave the previous
+    # result intact, never a partially-written artifact.
     output_path = cast(Path, arguments.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(f"{output_path.name}.tmp")

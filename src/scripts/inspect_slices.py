@@ -50,6 +50,8 @@ def inspect_slices(
     if preview_dims <= 0:
         raise ValueError("preview_dims must be positive")
 
+    # Load through the public dataset boundary so this command exercises the
+    # same manifest validation and memmap slicing used by training.
     path = Path(manifest_path)
     encoding_name = _manifest_encoding_name(path)
     encoding = tiktoken.get_encoding(encoding_name)
@@ -70,6 +72,8 @@ def inspect_slices(
         max_seq_len=seq_len,
     )
 
+    # These random educational layers are seeded for comparable inspections;
+    # they are not the weights of a trained checkpoint.
     torch.manual_seed(seed)
     token_embeddings = nn.Embedding(
         num_embeddings=config.vocab_size,
@@ -100,6 +104,8 @@ def inspect_slices(
     print(f"Context vectors shape: {list(context_vectors.shape)}")
     print("=" * 100)
 
+    # Print both the decoded window and the shifted-token invariants that the
+    # language-model loss relies on.
     previous_target_last: int | None = None
     for batch_index, (index, (input_ids, targets)) in enumerate(
         zip(indices, examples, strict=True)

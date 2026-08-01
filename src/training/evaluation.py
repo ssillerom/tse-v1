@@ -43,6 +43,25 @@ EVALUATION_PROMPTS = (
 )
 
 
+def evenly_spaced_validation_indices(dataset_size: int, sample_size: int) -> tuple[int, ...]:
+    """Choose a stable validation subset that spans the complete dataset."""
+    if not isinstance(dataset_size, int) or isinstance(dataset_size, bool) or dataset_size <= 0:
+        raise ValueError("dataset_size must be a positive integer")
+    if not isinstance(sample_size, int) or isinstance(sample_size, bool) or sample_size <= 0:
+        raise ValueError("sample_size must be a positive integer")
+    if sample_size >= dataset_size:
+        return tuple(range(dataset_size))
+    if sample_size == 1:
+        return (dataset_size // 2,)
+
+    # Integer arithmetic keeps the selection identical across Python and
+    # NumPy versions while including both ends of the validation split.
+    last_index = dataset_size - 1
+    return tuple(
+        sample_index * last_index // (sample_size - 1) for sample_index in range(sample_size)
+    )
+
+
 def perplexity_from_loss(loss: float) -> float:
     """Convert mean cross-entropy in nats to perplexity."""
     if (

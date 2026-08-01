@@ -9,6 +9,7 @@ from model.gpt import GPT
 from training.evaluation import (
     EVALUATION_PROMPTS,
     EvaluationPrompt,
+    evenly_spaced_validation_indices,
     generate_greedy,
     generate_prompt_samples,
     perplexity_from_loss,
@@ -19,6 +20,11 @@ def test_perplexity_converts_cross_entropy_back_to_effective_choices() -> None:
     assert perplexity_from_loss(0.0) == pytest.approx(1.0)
     assert perplexity_from_loss(math.log(8)) == pytest.approx(8.0)
     assert math.isinf(perplexity_from_loss(1_000.0))
+
+
+def test_validation_indices_cover_the_complete_split_deterministically() -> None:
+    assert evenly_spaced_validation_indices(dataset_size=10, sample_size=4) == (0, 3, 6, 9)
+    assert evenly_spaced_validation_indices(dataset_size=3, sample_size=10) == (0, 1, 2)
 
 
 class ScriptedGPT(GPT):

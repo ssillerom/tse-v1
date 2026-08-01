@@ -13,7 +13,7 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import islice
@@ -84,6 +84,27 @@ class PreparationStats:
     docs_skipped: int
     docs_truncated: int
     split_tokens: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
+class _DocumentBatch:
+    """Documents read together so tiktoken can encode valid texts in parallel."""
+
+    documents: tuple[str | None, ...]
+    valid_texts: tuple[str, ...]
+    source_exhausted: bool
+    source_error: Exception | None
+
+
+@dataclass
+class _PreparationCounters:
+    """Mutable counters owned by one staging-directory preparation."""
+
+    docs_seen: int = 0
+    docs_used: int = 0
+    docs_skipped: int = 0
+    docs_truncated: int = 0
+    total_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -619,6 +640,100 @@ def _install_staged_artifacts(staging_dir: Path, output_dir: Path) -> None:
     shutil.rmtree(backup_dir)
 
 
+def _read_document_batch(
+    document_iterator: Iterator[Mapping[str, object]],
+    *,
+    docs_seen: int,
+    max_docs: int | None,
+    text_field: str,
+    min_chars: int,
+) -> _DocumentBatch:
+    """Read one bounded source batch while preserving invalid-document positions."""
+    documents: list[str | None] = []
+    valid_texts: list[str] = []
+    batch_chars = 0
+    source_exhausted = False
+    source_error: Exception | None = None
+
+    while (
+        len(documents) < TOKENIZATION_BATCH_MAX_DOCS and batch_chars < TOKENIZATION_BATCH_MAX_CHARS
+    ):
+        if max_docs is not None and docs_seen + len(documents) >= max_docs:
+            source_exhausted = True
+            break
+        try:
+            document = next(document_iterator)
+        except StopIteration:
+            source_exhausted = True
+            break
+        except Exception as error:
+            source_error = error
+            source_exhausted = True
+            break
+
+        if text_field not in document:
+            source_error = KeyError(
+                f"text_field={text_field!r} not found. Available keys: {list(document.keys())}"
+            )
+            source_exhausted = True
+            break
+
+        text = document[text_field]
+        if not isinstance(text, str) or len(text) < min_chars:
+            documents.append(None)
+            continue
+        documents.append(text)
+        valid_texts.append(text)
+        batch_chars += len(text)
+
+    return _DocumentBatch(
+        documents=tuple(documents),
+        valid_texts=tuple(valid_texts),
+        source_exhausted=source_exhausted,
+        source_error=source_error,
+    )
+
+
+def _encode_document_batch(
+    texts: Sequence[str],
+    *,
+    encoding: tiktoken.Encoding,
+    workers: int,
+) -> list[list[int]]:
+    """Tokenize a batch without changing its source order."""
+    if not texts:
+        return []
+    if workers == 1:
+        return [encoding.encode(text, disallowed_special=()) for text in texts]
+    return encoding.encode_batch(
+        list(texts),
+        num_threads=workers,
+        disallowed_special=(),
+    )
+
+
+def _log_preparation_progress(
+    *,
+    writers: Mapping[str, TokenShardWriter],
+    total_tokens: int,
+    token_budget: int,
+) -> None:
+    """Report the invariant total = published shard tokens + in-memory tokens."""
+    saved_tokens = sum(shard.tokens for writer in writers.values() for shard in writer.shards)
+    buffered_tokens = sum(writer.pos for writer in writers.values())
+    saved_shards = sum(len(writer.shards) for writer in writers.values())
+    percentage = total_tokens / token_budget * 100
+    LOGGER.info(
+        "Progress | tokens=%s/%s (%.1f%%) | saved=%s | buffered=%s | shards=%s",
+        f"{total_tokens:,}",
+        f"{token_budget:,}",
+        percentage,
+        f"{saved_tokens:,}",
+        f"{buffered_tokens:,}",
+        f"{saved_shards:,}",
+    )
+
+
 def _prepare_into_staging_directory(
     staging_dir: Path,
     dataset: Iterable[Mapping[str, object]],
@@ -653,71 +768,34 @@ def _prepare_into_staging_directory(
         for split_name in output_splits
     }
     split_counts = {split_name: {"docs_used": 0, "docs_truncated": 0} for split_name in writers}
-    docs_seen = 0
-    docs_used = 0
-    docs_skipped = 0
-    docs_truncated = 0
-    total_tokens = 0
-
+    counters = _PreparationCounters()
     document_iterator = iter(dataset)
     source_exhausted = False
-    source_error: Exception | None = None
     next_log_at = log_every_docs
-    while total_tokens < num_tokens and not source_exhausted:
-        batch_documents: list[str | None] = []
-        texts: list[str] = []
-        batch_chars = 0
-        while (
-            len(batch_documents) < TOKENIZATION_BATCH_MAX_DOCS
-            and batch_chars < TOKENIZATION_BATCH_MAX_CHARS
-        ):
-            if max_docs is not None and docs_seen + len(batch_documents) >= max_docs:
-                source_exhausted = True
-                break
-            try:
-                document = next(document_iterator)
-            except StopIteration:
-                source_exhausted = True
-                break
-            except Exception as error:
-                source_error = error
-                source_exhausted = True
-                break
-
-            if text_field not in document:
-                source_error = KeyError(
-                    f"text_field={text_field!r} not found. Available keys: {list(document.keys())}"
-                )
-                source_exhausted = True
-                break
-
-            text = document[text_field]
-            if not isinstance(text, str) or len(text) < min_chars:
-                batch_documents.append(None)
-                continue
-            batch_documents.append(text)
-            texts.append(text)
-            batch_chars += len(text)
-
-        encoded_documents: list[list[int]] = []
-        if texts:
-            if workers == 1:
-                encoded_documents = [encoding.encode(text, disallowed_special=()) for text in texts]
-            else:
-                encoded_documents = encoding.encode_batch(
-                    texts,
-                    num_threads=workers,
-                    disallowed_special=(),
-                )
+    while counters.total_tokens < num_tokens and not source_exhausted:
+        batch = _read_document_batch(
+            document_iterator,
+            docs_seen=counters.docs_seen,
+            max_docs=max_docs,
+            text_field=text_field,
+            min_chars=min_chars,
+        )
+        source_exhausted = batch.source_exhausted
+        encoded_documents = _encode_document_batch(
+            batch.valid_texts,
+            encoding=encoding,
+            workers=workers,
+        )
 
         encoded_index = 0
-        for text in batch_documents:
-            docs_seen += 1
+        for text in batch.documents:
+            counters.docs_seen += 1
             if text is None:
-                docs_skipped += 1
+                counters.docs_skipped += 1
             else:
                 tokens = encoded_documents[encoded_index]
                 encoded_index += 1
+                # EOT makes document boundaries observable to the causal model.
                 tokens.append(encoding.eot_token)
                 output_split = _document_output_split(
                     text,
@@ -726,47 +804,38 @@ def _prepare_into_staging_directory(
                     split_seed,
                 )
                 writer = writers[output_split]
-                remaining_tokens = num_tokens - total_tokens
+                remaining_tokens = num_tokens - counters.total_tokens
                 document_truncated = len(tokens) > remaining_tokens
                 tokens_to_write = tokens if not document_truncated else tokens[:remaining_tokens]
                 if document_truncated:
+                    # A budget-truncated document still obeys the EOT invariant.
                     tokens_to_write[-1] = encoding.eot_token
                 tokens_added = writer.add_tokens(tokens_to_write)
-                total_tokens += tokens_added
+                counters.total_tokens += tokens_added
                 if tokens_added > 0:
-                    docs_used += 1
+                    counters.docs_used += 1
                     split_counts[output_split]["docs_used"] += 1
                 if document_truncated:
-                    docs_truncated += 1
+                    counters.docs_truncated += 1
                     split_counts[output_split]["docs_truncated"] += 1
 
-            if docs_seen >= next_log_at:
-                saved_tokens = sum(
-                    shard.tokens for writer in writers.values() for shard in writer.shards
-                )
-                buffered_tokens = sum(writer.pos for writer in writers.values())
-                saved_shards = sum(len(writer.shards) for writer in writers.values())
-                percentage = total_tokens / num_tokens * 100
-                LOGGER.info(
-                    "Progress | tokens=%s/%s (%.1f%%) | saved=%s | buffered=%s | shards=%s",
-                    f"{total_tokens:,}",
-                    f"{num_tokens:,}",
-                    percentage,
-                    f"{saved_tokens:,}",
-                    f"{buffered_tokens:,}",
-                    f"{saved_shards:,}",
+            if counters.docs_seen >= next_log_at:
+                _log_preparation_progress(
+                    writers=writers,
+                    total_tokens=counters.total_tokens,
+                    token_budget=num_tokens,
                 )
                 next_log_at += log_every_docs
 
-            if total_tokens >= num_tokens:
+            if counters.total_tokens >= num_tokens:
                 break
 
-        if source_error is not None and total_tokens < num_tokens:
-            raise source_error
+        if batch.source_error is not None and counters.total_tokens < num_tokens:
+            raise batch.source_error
 
     for writer in writers.values():
         writer.flush()
-    total_tokens = sum(writer.total_tokens for writer in writers.values())
+    counters.total_tokens = sum(writer.total_tokens for writer in writers.values())
     total_shards = sum(writer.shard_idx for writer in writers.values())
     shards: list[dict[str, object]] = []
     splits: dict[str, object] = {}
@@ -802,24 +871,24 @@ def _prepare_into_staging_directory(
         },
         "storage": {"dtype": STORAGE_DTYPE, "shard_size": shard_size},
         "counts": {
-            "tokens": total_tokens,
+            "tokens": counters.total_tokens,
             "shards": total_shards,
-            "docs_seen": docs_seen,
-            "docs_used": docs_used,
-            "docs_skipped": docs_skipped,
-            "docs_truncated": docs_truncated,
+            "docs_seen": counters.docs_seen,
+            "docs_used": counters.docs_used,
+            "docs_skipped": counters.docs_skipped,
+            "docs_truncated": counters.docs_truncated,
         },
         "splits": splits,
         "shards": shards,
     }
     write_manifest(staging_dir / "manifest.json", manifest)
     stats = PreparationStats(
-        tokens=total_tokens,
+        tokens=counters.total_tokens,
         shards=total_shards,
-        docs_seen=docs_seen,
-        docs_used=docs_used,
-        docs_skipped=docs_skipped,
-        docs_truncated=docs_truncated,
+        docs_seen=counters.docs_seen,
+        docs_used=counters.docs_used,
+        docs_skipped=counters.docs_skipped,
+        docs_truncated=counters.docs_truncated,
         split_tokens=tuple(
             (split_name, writer.total_tokens) for split_name, writer in writers.items()
         ),

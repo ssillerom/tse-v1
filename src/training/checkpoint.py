@@ -17,8 +17,8 @@ from src.model.gpt import GPT
 from .rng import TorchRngSnapshot, capture_torch_rng_state, restore_torch_rng_state
 from .trainer import TrainingConfig
 
-CHECKPOINT_FORMAT_VERSION = 5
-SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = frozenset({1, 2, 3, 4, CHECKPOINT_FORMAT_VERSION})
+CHECKPOINT_FORMAT_VERSION = 6
+SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = frozenset({1, 2, 3, 4, 5, CHECKPOINT_FORMAT_VERSION})
 CHECKPOINT_FILENAME_PATTERN = re.compile(r"step_(\d+)\.pt\Z")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -35,6 +35,8 @@ class RestoredCheckpoint:
     data_position: int
     tokens_seen: int
     source_tokens_seen: dict[str, int] | None
+    validation_loss: float | None
+    best_validation_loss: float | None
 
 
 @dataclass(frozen=True)
@@ -145,6 +147,19 @@ def _validate_source_tokens_seen(
     return normalized
 
 
+def _validate_optional_validation_loss(value: object) -> float | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, Real)
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or value < 0
+    ):
+        raise ValueError("validation_loss must be finite and non-negative or None")
+    return float(value)
+
+
 def save_checkpoint(
     path: str | Path,
     model: GPT,
@@ -159,6 +174,8 @@ def save_checkpoint(
     data_position: int = 0,
     tokens_seen: int = 0,
     source_tokens_seen: Mapping[str, int] | None = None,
+    validation_loss: float | None = None,
+    best_validation_loss: float | None = None,
 ) -> Path:
     """Atomically save the state required to resume training."""
     if not isinstance(step, int) or isinstance(step, bool) or step < 0:
@@ -183,6 +200,14 @@ def save_checkpoint(
         source_tokens_seen,
         tokens_seen,
     )
+    normalized_validation_loss = _validate_optional_validation_loss(validation_loss)
+    normalized_best_validation_loss = _validate_optional_validation_loss(best_validation_loss)
+    if (
+        normalized_validation_loss is not None
+        and normalized_best_validation_loss is not None
+        and normalized_best_validation_loss > normalized_validation_loss
+    ):
+        raise ValueError("best_validation_loss cannot exceed validation_loss")
 
     checkpoint_path = Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,6 +230,10 @@ def save_checkpoint(
         "data_position": data_position,
         "tokens_seen": tokens_seen,
         "source_tokens_seen": normalized_source_tokens_seen,
+        # Best-checkpoint selection must survive process restarts. Storing the
+        # metric beside the exact weights makes that decision auditable.
+        "validation_loss": normalized_validation_loss,
+        "best_validation_loss": normalized_best_validation_loss,
     }
 
     try:
@@ -279,6 +308,8 @@ def restore_checkpoint(
     data_position = payload.get("data_position", 0)
     tokens_seen = payload.get("tokens_seen", 0)
     source_tokens_seen = payload.get("source_tokens_seen")
+    validation_loss = payload.get("validation_loss")
+    best_validation_loss = payload.get("best_validation_loss")
     cuda_rng_states = payload.get("cuda_rng_states")
     mps_rng_state = payload.get("mps_rng_state")
     if not isinstance(model_state, dict):
@@ -314,6 +345,14 @@ def restore_checkpoint(
     if not isinstance(tokens_seen, int) or isinstance(tokens_seen, bool) or tokens_seen < 0:
         raise ValueError("checkpoint contains an invalid tokens_seen")
     source_tokens_seen = _validate_source_tokens_seen(source_tokens_seen, tokens_seen)
+    validation_loss = _validate_optional_validation_loss(validation_loss)
+    best_validation_loss = _validate_optional_validation_loss(best_validation_loss)
+    if (
+        validation_loss is not None
+        and best_validation_loss is not None
+        and best_validation_loss > validation_loss
+    ):
+        raise ValueError("checkpoint best_validation_loss cannot exceed validation_loss")
     if model_config != asdict(model.config):
         raise ValueError("checkpoint model_config does not match the current model configuration")
     if saved_training_config != asdict(training_config):
@@ -382,6 +421,8 @@ def restore_checkpoint(
         data_position=data_position,
         tokens_seen=tokens_seen,
         source_tokens_seen=source_tokens_seen,
+        validation_loss=validation_loss,
+        best_validation_loss=best_validation_loss,
     )
 
 

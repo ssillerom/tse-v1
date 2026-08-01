@@ -212,6 +212,7 @@ def evaluate_metrics(
         raise ValueError(f"max_batches must be a positive integer, got {max_batches!r}")
 
     was_training = model.training
+    rng_snapshot = capture_torch_rng_state()
     model.eval()
     total_loss = 0.0
     total_targets = 0
@@ -237,7 +238,13 @@ def evaluate_metrics(
                 total_loss += loss.item() * target_count
                 total_targets += target_count
     finally:
-        model.train(was_training)
+        # Creating a DataLoader iterator consumes PyTorch's global RNG even
+        # when validation is not shuffled. Evaluation is observational, so it
+        # must not change later dropout masks or worker seeds in training.
+        try:
+            model.train(was_training)
+        finally:
+            restore_torch_rng_state(rng_snapshot)
 
     if total_targets == 0:
         raise ValueError("evaluation batches contain no target tokens")
@@ -487,7 +494,9 @@ def train(
         if (
             validation_batches is not None
             and config.eval_interval is not None
-            and completed_step % config.eval_interval == 0
+            # Always evaluate the segment boundary so a deliberate stop or
+            # final run produces a comparable checkpoint.
+            and (completed_step % config.eval_interval == 0 or completed_step == effective_end_step)
         ):
             if isinstance(validation_batches, Mapping):
                 if validation_weights is None:
