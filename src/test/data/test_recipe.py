@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 
 from data.manifest import FORMAT_VERSION, STORAGE_DTYPE, write_manifest
-from data.recipe import RECIPE_FORMAT_VERSION, load_training_recipe
+from data.mixture import DeterministicMixtureSampler, MixtureDataset
+from data.recipe import RECIPE_FORMAT_VERSION, TrainingRecipe, load_training_recipe
 
 
 def _write_manifest(directory: Path, name: str, token_count: int = 128) -> Path:
@@ -50,6 +51,40 @@ def _write_manifest(directory: Path, name: str, token_count: int = 128) -> Path:
         },
     )
     return manifest_path
+
+
+def _load_shipped_recipe_with_local_manifests(
+    tmp_path: Path,
+    recipe_filename: str,
+) -> TrainingRecipe:
+    repository_root = Path(__file__).parents[3]
+    source_recipe_path = repository_root / "configs" / recipe_filename
+    payload = json.loads(source_recipe_path.read_text(encoding="utf-8"))
+    local_recipe_path = tmp_path / "configs" / recipe_filename
+    local_recipe_path.parent.mkdir(parents=True)
+
+    for source in payload["sources"]:
+        manifest_path = (local_recipe_path.parent / source["manifest"]).resolve()
+        manifest_path.parent.parent.mkdir(parents=True, exist_ok=True)
+        assert _write_manifest(manifest_path.parent.parent, manifest_path.parent.name) == (
+            manifest_path
+        )
+
+    local_recipe_path.write_text(json.dumps(payload), encoding="utf-8")
+    return load_training_recipe(local_recipe_path)
+
+
+def _build_sampler(recipe: TrainingRecipe, seq_len: int) -> DeterministicMixtureSampler:
+    source_lengths = {
+        source.name: range(recipe.source_token_totals[source.name] // seq_len)
+        for source in recipe.sources
+    }
+    return DeterministicMixtureSampler(
+        MixtureDataset(source_lengths),
+        recipe.phases,
+        seq_len=seq_len,
+        seed=42,
+    )
 
 
 def test_training_recipe_loads_relative_manifests_and_phase_quotas(tmp_path: Path) -> None:
@@ -153,53 +188,46 @@ def test_training_recipe_rejects_a_declared_source_that_receives_no_tokens(
         load_training_recipe(recipe_path)
 
 
-def test_shipped_12b_recipe_has_exact_sequences_and_only_reuses_web_source() -> None:
-    repository_root = Path(__file__).parents[3]
-    payload = json.loads(
-        (repository_root / "configs" / "pretrain_v1_english_12b.json").read_text(encoding="utf-8")
+def test_shipped_12b_recipe_has_quotas_aligned_to_2048_token_sequences(
+    tmp_path: Path,
+) -> None:
+    recipe = _load_shipped_recipe_with_local_manifests(
+        tmp_path,
+        "pretrain_v1_english_12b.json",
     )
-    stable_phase, decay_phase = payload["phases"]
-    sources_by_name = {source["name"]: source for source in payload["sources"]}
+    stable_phase, decay_phase = recipe.phases
+    sources_by_name = {source.name: source for source in recipe.sources}
 
-    assert stable_phase["tokens"] == 10_800_000_000
-    assert decay_phase["tokens"] == 1_200_000_000
-    assert sum(phase["tokens"] for phase in payload["phases"]) == 12_000_000_000
-    for phase in (stable_phase, decay_phase):
-        assert sum(phase["source_tokens"].values()) == phase["tokens"]
-        assert all(token_count % 1_024 == 0 for token_count in phase["source_tokens"].values())
-    assert set(stable_phase["source_tokens"]) & set(decay_phase["source_tokens"]) == {
+    assert stable_phase.target_tokens == 10_800_001_024
+    assert decay_phase.target_tokens == 1_199_998_976
+    assert recipe.total_tokens == 12_000_000_000
+    sampler = _build_sampler(recipe, seq_len=2_048)
+    assert len(sampler) == 5_859_375
+    assert set(stable_phase.source_token_map) & set(decay_phase.source_token_map) == {
         "fineweb_edu_sample_10bt"
     }
-    assert stable_phase["source_tokens"]["fineweb_edu_sample_10bt"] == 8_750_000_128
-    assert decay_phase["source_tokens"]["fineweb_edu_sample_10bt"] == 1_050_000_384
-    assert stable_phase["source_tokens"]["finewiki_en"] == 899_999_744
-    assert sources_by_name["fineweb_edu_sample_10bt"]["manifest"] == (
-        "../data/pretrain-v1/fineweb-edu-sample-10bt/manifest.json"
-    )
-    assert sources_by_name["finewiki_en"]["manifest"] == (
-        "../data/pretrain-v1/finewiki-en/manifest.json"
-    )
+    assert stable_phase.source_token_map["fineweb_edu_sample_10bt"] == 8_750_000_128
+    assert stable_phase.source_token_map["nemotron_math_3"] == 400_001_024
+    assert decay_phase.source_token_map["fineweb_edu_sample_10bt"] == 1_049_999_360
+    assert stable_phase.source_token_map["finewiki_en"] == 899_999_744
     assert "fineweb_edu_dedup" not in sources_by_name
     assert "nemotron_knowledge" not in sources_by_name
 
 
-def test_shipped_300m_recipes_hold_compute_constant_and_change_only_the_mix() -> None:
-    repository_root = Path(__file__).parents[3]
-    mixture = json.loads(
-        (repository_root / "configs" / "pretrain_v1_english_300m_mixture.json").read_text(
-            encoding="utf-8"
-        )
+def test_shipped_300m_recipes_hold_compute_constant_and_change_only_the_mix(
+    tmp_path: Path,
+) -> None:
+    mixture = _load_shipped_recipe_with_local_manifests(
+        tmp_path / "mixture",
+        "pretrain_v1_english_300m_mixture.json",
     )
-    baseline = json.loads(
-        (repository_root / "configs" / "pretrain_v1_english_300m_fineweb_baseline.json").read_text(
-            encoding="utf-8"
-        )
+    baseline = _load_shipped_recipe_with_local_manifests(
+        tmp_path / "baseline",
+        "pretrain_v1_english_300m_fineweb_baseline.json",
     )
 
-    assert mixture["phases"][0]["tokens"] == 299_892_736
-    assert baseline["phases"][0]["tokens"] == 299_892_736
-    assert sum(mixture["phases"][0]["source_tokens"].values()) == 299_892_736
-    assert baseline["phases"][0]["source_tokens"] == {"fineweb_edu_sample_10bt": 299_892_736}
-    assert all(
-        token_count % 1_024 == 0 for token_count in mixture["phases"][0]["source_tokens"].values()
-    )
+    assert mixture.total_tokens == 299_892_736
+    assert baseline.total_tokens == 299_892_736
+    assert len(_build_sampler(mixture, seq_len=2_048)) == 146_432
+    assert len(_build_sampler(baseline, seq_len=2_048)) == 146_432
+    assert baseline.phases[0].source_token_map == {"fineweb_edu_sample_10bt": 299_892_736}

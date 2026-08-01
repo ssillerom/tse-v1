@@ -13,11 +13,12 @@ PREPARE_WORKERS ?= 2
 PREPARE_SOURCE_WORKERS ?= 2
 MAX_LEARNING_RATE ?= 0.0006
 TORCH_COMPILE_ARGS ?=
-A100_BATCH_SIZE ?= 8
+SEQ_LEN := 2048
+A100_BATCH_SIZE ?= 4
 A100_GRAD_ACCUM_STEPS ?= 64
 A100_RUN_NAME ?= v1-a100-rehearsal
 A100_CHECKPOINT_DIR ?= checkpoints/$(A100_RUN_NAME)
-H100_BATCH_SIZE ?= 16
+H100_BATCH_SIZE ?= 8
 H100_GRAD_ACCUM_STEPS ?= 32
 H100_RUN_NAME ?= v1-english-12b
 H100_CHECKPOINT_DIR ?= checkpoints/$(H100_RUN_NAME)
@@ -48,7 +49,7 @@ MODEL_ARGS := \
 	--d-model 1024 \
 	--n-layers 24 \
 	--n-heads 16 \
-	--seq-len 1024 \
+	--seq-len $(SEQ_LEN) \
 	$(TORCH_COMPILE_ARGS)
 
 RUNTIME_ARGS := \
@@ -243,7 +244,7 @@ $(FACT_MANIFEST):
 		--encoding gpt2
 
 validate-recipe: ## Validate manifests, tokenizer agreement, quotas, and source capacity.
-	@$(UV) run python -c 'from src.data.dataset import PretrainingDataset; from src.data.mixture import DeterministicMixtureSampler, MixtureDataset; from src.data.recipe import load_training_recipe; recipe=load_training_recipe("$(RECIPE)"); datasets={source.name: PretrainingDataset(source.manifest_path, "train", 1024) for source in recipe.sources}; mixture=MixtureDataset(datasets); sampler=DeterministicMixtureSampler(mixture, recipe.phases, 1024, 42); print(f"recipe={recipe.name} tokens={recipe.total_tokens:,} sequences={len(sampler):,} sources={len(recipe.sources)}")'
+	@$(UV) run python -c 'from src.data.dataset import PretrainingDataset; from src.data.mixture import DeterministicMixtureSampler, MixtureDataset; from src.data.recipe import load_training_recipe; recipe=load_training_recipe("$(RECIPE)"); datasets={source.name: PretrainingDataset(source.manifest_path, "train", $(SEQ_LEN)) for source in recipe.sources}; mixture=MixtureDataset(datasets); sampler=DeterministicMixtureSampler(mixture, recipe.phases, $(SEQ_LEN), 42); print(f"recipe={recipe.name} seq_len=$(SEQ_LEN) tokens={recipe.total_tokens:,} sequences={len(sampler):,} sources={len(recipe.sources)}")'
 
 runpod-ready: local-gate gpu-check credentials-check validate-recipe ## Run every check required immediately before a paid training job.
 

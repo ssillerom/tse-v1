@@ -8,7 +8,7 @@ def test_sdpa_does_not_allocate_a_quadratic_causal_mask() -> None:
     attention = MultiHeadAttention(
         d_model=16,
         n_heads=4,
-        max_seq_len=1_024,
+        max_seq_len=2_048,
         use_sdpa=True,
     )
 

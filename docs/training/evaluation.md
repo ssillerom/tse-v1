@@ -35,7 +35,7 @@ The 300M-token recipes provide a cheap controlled comparison:
 - `configs/pretrain_v1_english_300m_mixture.json`;
 - `configs/pretrain_v1_english_300m_fineweb_baseline.json`.
 
-Both contain exactly 292,864 sequences, or 299,892,736 tokens at context length 1,024. Train
+Both contain exactly 146,432 sequences, or 299,892,736 tokens at context length 2,048. Train
 them with the same architecture, seed, optimizer, LR, batch, precision, and hardware. The
 only intended difference is the data distribution. Use independent checkpoint directories
 and W&B names.
@@ -51,8 +51,8 @@ uv run train-v1 \
   --d-model 1024 \
   --n-layers 24 \
   --n-heads 16 \
-  --seq-len 1024 \
-  --batch-size 8 \
+  --seq-len 2048 \
+  --batch-size 4 \
   --grad-accum-steps 64 \
   --warmup-steps 50 \
   --lr-schedule wsd \
@@ -91,7 +91,7 @@ uv run eval-checkpoint \
   --checkpoint checkpoints/v1-english-12b/step_022888.pt \
   --device cuda \
   --precision bf16 \
-  --batch-size 16 \
+  --batch-size 8 \
   --output results/v1-english-12b-base.json
 ```
 
@@ -109,7 +109,7 @@ uv run eval-checkpoint \
   --num-fewshot 5 \
   --device cuda \
   --precision bf16 \
-  --batch-size 16 \
+  --batch-size 8 \
   --output results/v1-english-12b-gsm8k-5shot.json
 ```
 

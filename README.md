@@ -207,7 +207,8 @@ uv run train-v1 \
   --wandb-mode disabled
 ```
 
-La receta propuesta para el run completo, junto con los gates local, A100 y H100 SXM, está en
+La receta propuesta para el run completo usa contexto 2.048, conserva un batch global de
+524.288 tokens y, junto con los gates local, A100 y H100 SXM, está en
 [V1 English 12B training run](docs/training/v1-english-12b.md). La ejecución reproducible en
 RunPod está detallada en [Running the V1 recipe on RunPod](docs/training/runpod-v1.md) y
 automatizada con `make help`.

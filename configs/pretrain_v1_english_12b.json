@@ -30,19 +30,19 @@
   "phases": [
     {
       "name": "stable",
-      "tokens": 10800000000,
+      "tokens": 10800001024,
       "source_tokens": {
         "fineweb_edu_sample_10bt": 8750000128,
         "stack_v3_python": 750000128,
-        "nemotron_math_3": 400000000,
+        "nemotron_math_3": 400001024,
         "finewiki_en": 899999744
       }
     },
     {
       "name": "decay",
-      "tokens": 1200000000,
+      "tokens": 1199998976,
       "source_tokens": {
-        "fineweb_edu_sample_10bt": 1050000384,
+        "fineweb_edu_sample_10bt": 1049999360,
         "nemotron_math_4plus": 99999744,
         "nemotron_fact_seeking": 49999872
       }

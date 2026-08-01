@@ -1,6 +1,6 @@
 # Running the V1 recipe on RunPod
 
-This guide executes the pinned 12B-token recipe through explicit Make targets. Data,
+This guide executes the pinned 12B-token, 2,048-context recipe through explicit Make targets. Data,
 checkpoints, caches, and W&B logs stay under `/workspace`; nothing important should be kept
 only on the container disk.
 
@@ -156,20 +156,20 @@ Do not continue unless:
 - W&B samples become less random;
 - the resumed process continues the original W&B run at step 250.
 
-If micro-batch 8 runs comfortably, the H100 target later uses micro-batch 16. If either runs
-out of memory, preserve the 512-sequence global batch by overriding both values together.
-You may also test `16 × 32` on the A100 by passing the same overrides to both commands:
+If micro-batch 4 runs comfortably, the H100 target later uses micro-batch 8. If either runs
+out of memory, preserve the 524,288-token global batch by overriding both values together.
+You may also test `8 × 32` on the A100 by passing the same overrides to both commands:
 
 ```bash
 make a100-rehearsal-start \
-  A100_BATCH_SIZE=16 \
+  A100_BATCH_SIZE=8 \
   A100_GRAD_ACCUM_STEPS=32 \
-  A100_RUN_NAME=v1-a100-rehearsal-16x32
+  A100_RUN_NAME=v1-a100-rehearsal-8x32
 
 make a100-rehearsal-resume \
-  A100_BATCH_SIZE=16 \
+  A100_BATCH_SIZE=8 \
   A100_GRAD_ACCUM_STEPS=32 \
-  A100_RUN_NAME=v1-a100-rehearsal-16x32
+  A100_RUN_NAME=v1-a100-rehearsal-8x32
 ```
 
 ## 5. Choose the maximum learning rate
@@ -235,13 +235,13 @@ make h100-resume MAX_LEARNING_RATE=0.0006
 The resume command must use the same LR and batch configuration. It restores model,
 optimizer, RNG, W&B run identity, and exact recipe position.
 
-If micro-batch 16 does not fit, start with `8 × 64` and repeat those overrides on every
+If micro-batch 8 does not fit, start with `4 × 64` and repeat those overrides on every
 resume:
 
 ```bash
 make h100-train \
   MAX_LEARNING_RATE=0.0006 \
-  H100_BATCH_SIZE=8 \
+  H100_BATCH_SIZE=4 \
   H100_GRAD_ACCUM_STEPS=64
 ```
 

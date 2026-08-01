@@ -6,9 +6,9 @@ training system single-device and uses staged proofs before renting the final H1
 ## Fixed model and token budget
 
 - 353M parameters: `d_model=1024`, 24 layers, 16 MHA heads.
-- Context length: 1,024.
+- Context length: 2,048.
 - GPT-2 `tiktoken` vocabulary padded to 50,304.
-- Global batch: 512 sequences = 524,288 tokens per optimizer step.
+- Global batch: 256 sequences = 524,288 tokens per optimizer step.
 - Final budget: at most 12B tokens.
 - 22,888 complete optimizer steps consume 11,999,903,744 tokens. The remaining 96,256
   recipe tokens cannot form a complete optimizer step and are intentionally unused.
@@ -37,8 +37,8 @@ decay.
 | Knowledge | FineWiki English, 0.90B | Nemotron Pretraining Fact-Seeking, 0.05B |
 | **Total** | **10.80B** | **1.20B** |
 
-The JSON quotas differ from these rounded labels by at most 640 tokens so that every source
-quota is an exact number of 1,024-token sequences.
+The JSON quotas differ from these rounded labels by at most 1,024 tokens so that every phase
+and source quota is an exact number of 2,048-token sequences.
 
 Before preparing the NVIDIA mathematics source, accept the data agreement on the
 `nvidia/Nemotron-CC-Math-v1` Hub page, run `hf auth login`, and keep `--hf-token` on those
@@ -47,7 +47,7 @@ command below is pinned to its tested revision; keep the generated manifests bec
 is not a reproducible revision.
 
 FineWeb-Edu is prepared to the 10B sample cap and assigns 1% to validation, leaving expected
-headroom above its 9.800000512B-token training quota. The other sources prepare slightly more
+headroom above its 9.799999488B-token training quota. The other sources prepare slightly more
 than their quotas and assign 2% to validation. The commands below create 100M-token shards
 and use the same GPT-2 encoding. New preparations publish manifest v3 with a SHA-256 for every
 shard; recipe validation rejects corruption before a paid training run.
@@ -172,7 +172,7 @@ recipe quota, and the tokenizer metadata must be identical:
 uv run inspect-data-slices \
   --manifest data/pretrain-v1/fineweb-edu-sample-10bt/manifest.json \
   --split train \
-  --seq-len 1024 \
+  --seq-len 2048 \
   --num-examples 3
 ```
 
@@ -201,8 +201,8 @@ The important behavioural proofs are:
 ## Gate 2: A100 full-model rehearsal
 
 Use an A100 for the first paid run. This is not a tiny-model test: it uses the final 353M
-architecture, context, precision and global batch. Start with micro-batch 8 and accumulation
-64. If it is comfortably below VRAM, use 16 × 32 instead.
+architecture, context, precision and global token batch. Start with micro-batch 4 and
+accumulation 64. If it is comfortably below VRAM, use 8 × 32 instead.
 
 ```bash
 uv run train-v1 \
@@ -212,8 +212,8 @@ uv run train-v1 \
   --d-model 1024 \
   --n-layers 24 \
   --n-heads 16 \
-  --seq-len 1024 \
-  --batch-size 8 \
+  --seq-len 2048 \
+  --batch-size 4 \
   --grad-accum-steps 64 \
   --max-steps 500 \
   --stop-after-step 250 \
@@ -309,8 +309,8 @@ uv run train-v1 \
   --d-model 1024 \
   --n-layers 24 \
   --n-heads 16 \
-  --seq-len 1024 \
-  --batch-size 16 \
+  --seq-len 2048 \
+  --batch-size 8 \
   --grad-accum-steps 32 \
   --warmup-steps 400 \
   --lr-schedule wsd \
@@ -329,8 +329,8 @@ uv run train-v1 \
 
 Watch the first 100 steps live before leaving the job unattended. At step 1,000, verify the
 saved checkpoint on the same H100 with `--resume latest`; continuing the same run is preferable
-to starting over. If micro-batch 16 does not fit, use 8 × 64. This preserves the global batch,
-number of optimizer steps and schedule. The final segment boundary is evaluated even though
+to starting over. If micro-batch 8 does not fit, use 4 × 64. This preserves the global token
+batch, number of optimizer steps and schedule. The final segment boundary is evaluated even though
 22,888 is not divisible by 500; compare `best_validation.pt` with the final numbered checkpoint
 before running the post-hoc suite.
 
