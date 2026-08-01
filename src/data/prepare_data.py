@@ -3,6 +3,8 @@
 Documents are tokenized with a configurable tiktoken encoding and separated by
 that encoding's end-of-text token. Each run also writes a manifest describing
 the source, tokenizer, storage format, counters, and generated shards.
+
+Author: Sergio Sillero.
 """
 
 import argparse

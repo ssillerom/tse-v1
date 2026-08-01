@@ -3,6 +3,8 @@
 The script reconstructs the raw model from its checkpoint, adapts it to the
 EleutherAI harness, then atomically writes results together with enough model,
 tokenizer, dependency, and Git metadata to identify the exact evaluation.
+
+Author: Sergio Sillero.
 """
 
 import argparse

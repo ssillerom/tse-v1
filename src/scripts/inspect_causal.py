@@ -1,4 +1,7 @@
-"""Show the smallest token IDs -> embeddings -> causal-attention forward path."""
+"""Show the smallest token IDs -> embeddings -> causal-attention forward path.
+
+Author: Sergio Sillero.
+"""
 
 import tiktoken
 import torch

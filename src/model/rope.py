@@ -1,20 +1,20 @@
-"""RoPE: incorpora posición rotando por parejas las componentes de Q y K.
+"""RoPE: inject position by rotating Q and K components in pairs.
 
-RoPE no suma un embedding posicional al flujo residual. Antes de calcular la
-atención, interpreta cada pareja de componentes de queries y keys como un punto
-2D y la rota con un ángulo que depende de la posición del token y de una
-frecuencia. Las dimensiones rotan a distintas velocidades, lo que proporciona
-varias escalas para representar distancias.
+RoPE does not add a positional embedding to the residual stream. Before
+attention is computed, it interprets each pair of query and key components as
+a 2D point and rotates it by an angle determined by token position and
+frequency. Dimensions rotate at different speeds, providing multiple scales
+for representing distances.
 
-Una rotación conserva la magnitud del vector, pero cambia el producto escalar
-entre una query y una key. Al rotar ambas, ese producto pasa a depender de su
-distancia relativa, permitiendo que la atención distinga orden y separación
-entre tokens. Los values no se rotan porque transportan contenido, mientras Q
-y K determinan qué posiciones se relacionan.
+A rotation preserves vector magnitude but changes the dot product between a
+query and a key. Rotating both makes that product depend on their relative
+distance, allowing attention to distinguish token order and separation. Values
+are not rotated because they carry content, while Q and K determine which
+positions relate to one another.
 
-Este módulo precalcula senos y cosenos, los guarda en ``RoPECache`` y aplica la
-rotación con aritmética real. La forma de Q y K se conserva:
-``[batch, tokens, heads, head_dim]``.
+This module precomputes sines and cosines, stores them in ``RoPECache``, and
+applies the rotation with real-valued arithmetic. The shapes of Q and K are
+preserved: ``[batch, tokens, heads, head_dim]``.
 """
 
 import torch

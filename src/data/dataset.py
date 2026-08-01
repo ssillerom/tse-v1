@@ -31,7 +31,7 @@ class PretrainingDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
     ) -> None:
         self.split = split
 
-        # TODO 1: validar seq_len.
+        # TODO 1: validate seq_len.
         self.seq_len = seq_len
         if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len <= 0:
             raise ValueError(f"seq_len must be a positive integer, got {seq_len!r}")
@@ -40,7 +40,7 @@ class PretrainingDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         split_shards = manifest.shards_for_split(split)
         self.shards = [self._open_shard(shard) for shard in split_shards]
 
-        # TODO 7: construir el índice acumulativo de secuencias.
+        # TODO 7: build the cumulative sequence index.
         sequence_counts = np.array(
             [shard.sequence_count for shard in self.shards],
             dtype=np.int64,
@@ -59,23 +59,23 @@ class PretrainingDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return one input/target pair, both with shape [seq_len]."""
-        # TODO 8: comprobar que el índice está dentro del rango.
+        # TODO 8: check that the index is within bounds.
         if not isinstance(index, int) or index < 0 or index >= len(self):
             raise IndexError(f"Index {index} is out of range for dataset of length {len(self)}")
 
-        # TODO 9: localizar shard y posición local.
+        # TODO 9: locate the shard and local position.
         shard_idx, local_idx = self._locate_sequence(index)
 
-        # TODO 10: extraer seq_len + 1 tokens.
+        # TODO 10: extract seq_len + 1 tokens.
         start = local_idx * self.seq_len
         tokens = self.shards[shard_idx].tokens[start : start + self.seq_len + 1]
 
-        # TODO 11: convertir a torch.long.
+        # TODO 11: convert to torch.long.
         array = tokens.astype(np.int64, copy=True)
 
         torch_tokens = torch.from_numpy(array).to(torch.long)
 
-        # TODO 12: separar input_ids y targets.
+        # TODO 12: split input_ids and targets.
         input_ids = torch_tokens[: self.seq_len]
         target_ids = torch_tokens[1 : self.seq_len + 1]
         return input_ids, target_ids

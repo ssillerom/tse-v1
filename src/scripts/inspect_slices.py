@@ -1,4 +1,7 @@
-"""Inspect pretraining dataset slices as token IDs and decoded text."""
+"""Inspect pretraining dataset slices as token IDs and decoded text.
+
+Author: Sergio Sillero.
+"""
 
 import argparse
 import json

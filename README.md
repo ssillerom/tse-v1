@@ -217,6 +217,21 @@ La evaluación post-hoc mediante LM Evaluation Harness, las métricas por domini
 FineWeb-only están descritos en [Evaluation protocol](docs/training/evaluation.md). El harness
 se instala como extra opcional con `uv sync --extra eval`.
 
+## Documentación
+
+- [Receta V1 English 12B](docs/training/v1-english-12b.md): arquitectura, mezcla de datos,
+  gates y entrenamiento con contexto 2.048.
+- [Ejecución en RunPod](docs/training/runpod-v1.md): preparación reproducible, rehearsal en
+  A100 y ejecución final en H100 SXM.
+- [Protocolo de evaluación](docs/training/evaluation.md): validación durante el pretraining,
+  baseline controlado de 300M y benchmarks post-hoc.
+- [Recetas públicas de entrenamiento](docs/research/open-llm-training-recipes.md): referencias
+  para comparar transparencia y reproducibilidad.
+
+## Créditos
+
+Los scripts de preparación, inspección, entrenamiento y evaluación son obra de Sergio Sillero.
+
 ## Desarrollo
 
 ```bash
@@ -239,8 +254,8 @@ documentos pequeños y escriben shards reales en directorios temporales.
 ## Limitaciones actuales
 
 - Solo se admiten tokenizadores de `tiktoken` cuyos IDs quepan en `uint16`.
-- La preparación todavía no puede reanudarse a mitad de un dataset.
-- La tokenización es de un solo proceso.
+- La preparación paralela conserva el orden por lote, pero todavía no puede reanudarse a mitad
+  de un dataset.
 - Las secuencias no cruzan fronteras de shard; la cola incompleta de cada shard se descarta.
 - El entrenamiento actual es de un solo dispositivo; CUDA usa BF16 con
   `--precision auto` cuando el hardware lo soporta.

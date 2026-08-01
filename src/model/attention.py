@@ -1,22 +1,22 @@
-"""Multi-head causal self-attention: cada token consulta su posición y el pasado.
+"""Multi-head causal self-attention: each token attends to its position and past.
 
-La capa recibe ``x`` con forma ``[batch, tokens, d_model]`` y crea tres
-representaciones aprendidas:
+The layer receives ``x`` with shape ``[batch, tokens, d_model]`` and creates
+three learned representations:
 
-- Query (Q): qué información busca el token actual.
-- Key (K): cómo puede ser encontrado cada token.
-- Value (V): qué información entrega cada token si recibe atención.
+- Query (Q): the information the current token is looking for.
+- Key (K): how each token can be found by other tokens.
+- Value (V): the information each token provides when it is attended to.
 
-Q, K y V se dividen en cabezas para que existan varios espacios de relación en
-paralelo. RoPE rota Q y K para introducir posición. La atención puede calcularse
-con PyTorch SDPA, que selecciona un kernel eficiente cuando está disponible, o
-con la implementación manual conservada para aprendizaje. Ambas rutas aplican
-el escalado, la máscara causal, softmax y dropout antes de combinar los values.
+Q, K, and V are split into heads so that several relationship spaces can be
+learned in parallel. RoPE rotates Q and K to inject position information.
+Attention can use PyTorch SDPA, which selects an efficient kernel when
+available, or the manual implementation retained for teaching. Both paths
+apply scaling, the causal mask, softmax, and dropout before combining values.
 
-Finalmente se reúnen las cabezas y ``W_o`` mezcla sus resultados. La forma de
-salida vuelve a ser ``[batch, tokens, d_model]`` para permitir la conexión
-residual del Transformer. Las cabezas pueden aprender patrones distintos
-gracias a sus proyecciones, aunque nada obliga a que no se solapen.
+The heads are then joined and ``W_o`` mixes their results. The output shape is
+again ``[batch, tokens, d_model]`` so it can feed the Transformer's residual
+connection. Different heads can learn different patterns, although their
+projections are not required to remain disjoint.
 """
 
 import math
@@ -89,28 +89,28 @@ class MultiHeadAttention(nn.Module):
             base=rope_theta,
         )
 
-        # Q decide qué busca cada token.
+        # Q determines what each token is looking for.
         self.W_q = nn.Linear(
             in_features=d_model,
             out_features=d_model,
             bias=qkv_bias,
         )
 
-        # K describe cómo puede ser encontrado cada token.
+        # K describes how each token can be found.
         self.W_k = nn.Linear(
             in_features=d_model,
             out_features=d_model,
             bias=qkv_bias,
         )
 
-        # V contiene la información que entrega cada token.
+        # V contains the information each token provides.
         self.W_v = nn.Linear(
             in_features=d_model,
             out_features=d_model,
             bias=qkv_bias,
         )
 
-        # Mezcla los resultados producidos por todas las cabezas.
+        # Mix the results produced by all heads.
         self.W_o = nn.Linear(
             in_features=d_model,
             out_features=d_model,
@@ -122,7 +122,7 @@ class MultiHeadAttention(nn.Module):
 
         causal_mask = None
         if not use_sdpa:
-            # True marca las posiciones futuras que debe ocultar la ruta manual.
+            # True marks future positions that the manual path must hide.
             causal_mask = torch.triu(
                 torch.ones(
                     max_seq_len,
@@ -132,8 +132,8 @@ class MultiHeadAttention(nn.Module):
                 diagonal=1,
             )
 
-        # No es un parámetro entrenable, pero se moverá con la capa
-        # cuando se utilice CPU, CUDA o MPS.
+        # This is not a trainable parameter, but it moves with the layer
+        # when the layer is used on CPU, CUDA, or MPS.
         self.register_buffer(
             "causal_mask",
             causal_mask,
@@ -153,18 +153,18 @@ class MultiHeadAttention(nn.Module):
             raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len={self.max_seq_len}")
 
         # ---------------------------------------------------------
-        # 1. Crear queries, keys y values
+        # 1. Create queries, keys, and values
         # ---------------------------------------------------------
 
         q = self.W_q(x)
         k = self.W_k(x)
         v = self.W_v(x)
 
-        # Forma:
+        # Shape:
         # [batch_size, seq_len, d_model]
 
         # ---------------------------------------------------------
-        # 2. Separar d_model en múltiples cabezas
+        # 2. Split d_model into multiple heads
         # ---------------------------------------------------------
 
         q = q.view(
@@ -188,7 +188,7 @@ class MultiHeadAttention(nn.Module):
             self.head_dim,
         )
 
-        # Forma:
+        # Shape:
         # [batch_size, seq_len, n_heads, head_dim]
 
         # RoPE rotates queries and keys before their dot product so attention
@@ -198,18 +198,18 @@ class MultiHeadAttention(nn.Module):
         k = apply_rope(k, freqs)
 
         # ---------------------------------------------------------
-        # 3. Colocar n_heads antes de seq_len
+        # 3. Move n_heads before seq_len
         # ---------------------------------------------------------
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Forma:
+        # Shape:
         # [batch_size, n_heads, seq_len, head_dim]
 
         # ---------------------------------------------------------
-        # 4. Calcular atención con SDPA o con la ruta manual
+        # 4. Compute attention with SDPA or the manual path
         # ---------------------------------------------------------
 
         if self.use_sdpa:
@@ -240,16 +240,16 @@ class MultiHeadAttention(nn.Module):
             attention_weights = self.attention_dropout(attention_weights)
             context = attention_weights @ v
 
-        # Forma:
+        # Shape:
         # [batch_size, n_heads, seq_len, head_dim]
 
         # ---------------------------------------------------------
-        # 5. Volver a unir las cabezas
+        # 5. Join the heads again
         # ---------------------------------------------------------
 
         context = context.transpose(1, 2)
 
-        # Forma:
+        # Shape:
         # [batch_size, seq_len, n_heads, head_dim]
 
         context = context.contiguous().view(
@@ -258,11 +258,11 @@ class MultiHeadAttention(nn.Module):
             self.d_model,
         )
 
-        # Forma:
+        # Shape:
         # [batch_size, seq_len, d_model]
 
         # ---------------------------------------------------------
-        # 6. Mezclar la información de todas las cabezas
+        # 6. Mix information from all heads
         # ---------------------------------------------------------
 
         output: torch.Tensor = self.W_o(context)

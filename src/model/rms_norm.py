@@ -1,15 +1,14 @@
-"""RMSNorm: estabiliza la escala del vector que representa cada token.
+"""RMSNorm: stabilize the scale of the vector representing each token.
 
-Para cada token calcula la raíz de la media de los cuadrados de sus
-características y divide el vector entre ese valor:
-``x_normalizado = x / sqrt(mean(x**2) + eps)``.
+For each token, RMSNorm computes the root mean square of its features and
+divides the vector by that value:
+``x_normalized = x / sqrt(mean(x**2) + eps)``.
 
-Esto mantiene controlada la magnitud de las activaciones sin restar su media,
-a diferencia de LayerNorm. Después, el parámetro entrenable ``gamma`` permite
-que el modelo recupere o ajuste la escala útil de cada característica. ``eps``
-evita divisiones inestables y el cálculo se hace en float32 para proteger
-entradas float16/bfloat16 frente a desbordamientos. La forma del tensor no
-cambia: ``[batch, tokens, d_model]`` entra y sale.
+This controls activation magnitude without subtracting the mean, unlike
+LayerNorm. The learned ``gamma`` parameter can then restore or adjust the
+useful scale of each feature. ``eps`` prevents unstable divisions, and the
+calculation uses float32 to protect float16/bfloat16 inputs from overflow. The
+tensor shape is unchanged: ``[batch, tokens, d_model]`` enters and leaves.
 """
 
 import torch

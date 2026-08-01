@@ -1,17 +1,17 @@
-"""SwiGLU MLP: transforma las características de cada token por separado.
+"""SwiGLU MLP: transform each token's features independently.
 
-La atención mezcla información entre tokens; esta MLP no mezcla posiciones.
-Recibe cada vector de tamaño ``d_model`` y crea dos proyecciones:
+Attention mixes information between tokens; this MLP does not mix positions.
+It receives each vector of size ``d_model`` and creates two projections:
 
-1. ``w_gate(x)`` pasa por SiLU y decide qué características dejar pasar.
-2. ``w_up(x)`` contiene las características candidatas que se quieren procesar.
-3. Ambas ramas se multiplican elemento a elemento y ``w_down`` devuelve el
-   resultado a ``d_model`` para poder sumarlo a la conexión residual.
+1. ``w_gate(x)`` passes through SiLU and chooses which features to allow through.
+2. ``w_up(x)`` contains the candidate features to process.
+3. The branches are multiplied elementwise and ``w_down`` returns the result to
+   ``d_model`` so it can be added to the residual connection.
 
-La operación es ``w_down(SiLU(w_gate(x)) * w_up(x))`` y conserva la forma
-``[batch, tokens, d_model]``. La dimensión oculta usa aproximadamente
-``8/3 * d_model`` para mantener un número de parámetros similar al de una MLP
-clásica con expansión ``4 * d_model``, ya que SwiGLU tiene tres matrices.
+The operation is ``w_down(SiLU(w_gate(x)) * w_up(x))`` and preserves the shape
+``[batch, tokens, d_model]``. The hidden dimension uses approximately
+``8/3 * d_model`` to keep the parameter count close to a classic MLP with a
+``4 * d_model`` expansion, because SwiGLU uses three matrices.
 """
 
 import torch

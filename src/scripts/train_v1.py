@@ -3,6 +3,8 @@
 The CLI validates an immutable run contract, opens deterministic train and
 validation data, restores an optional checkpoint, and then coordinates the
 trainer with W&B logging and atomic latest/best checkpoints.
+
+Author: Sergio Sillero.
 """
 
 import argparse
