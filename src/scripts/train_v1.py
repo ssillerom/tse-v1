@@ -649,6 +649,11 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
             sample_interval=arguments.sample_interval,
             max_new_tokens=arguments.max_new_tokens,
+            validation_domains=(
+                tuple(dataset_bundle.validation_batches)
+                if isinstance(dataset_bundle.validation_batches, Mapping)
+                else ()
+            ),
         )
         initial_validation_loss = _log_initial_validation(
             run=run,

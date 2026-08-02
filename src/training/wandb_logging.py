@@ -102,6 +102,7 @@ class WandbEvaluationLogger:
     sample_interval: int = 100
     max_new_tokens: int = 64
     prompts: Sequence[EvaluationPrompt] = EVALUATION_PROMPTS
+    validation_domains: Sequence[str] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -142,19 +143,24 @@ class WandbEvaluationLogger:
             summary="min",
         )
         self.run.define_metric(
-            "validation/*/loss",
-            step_metric="trainer/global_step",
-            summary="min",
-        )
-        self.run.define_metric(
-            "validation/*/perplexity",
-            step_metric="trainer/global_step",
-            summary="min",
-        )
-        self.run.define_metric(
-            "validation/*/target_tokens",
+            "validation/*",
             step_metric="trainer/global_step",
         )
+        for domain in self.validation_domains:
+            self.run.define_metric(
+                f"validation/{domain}/loss",
+                step_metric="trainer/global_step",
+                summary="min",
+            )
+            self.run.define_metric(
+                f"validation/{domain}/perplexity",
+                step_metric="trainer/global_step",
+                summary="min",
+            )
+            self.run.define_metric(
+                f"validation/{domain}/target_tokens",
+                step_metric="trainer/global_step",
+            )
         self.run.define_metric(
             "samples/fixed_prompts",
             step_metric="trainer/global_step",

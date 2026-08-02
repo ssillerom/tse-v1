@@ -4,6 +4,7 @@ from collections.abc import Mapping
 import pytest
 import tiktoken
 import torch
+import wandb
 
 from model.config import ModelConfig
 from model.gpt import GPT
@@ -140,6 +141,28 @@ class ScriptedGPT(GPT):
         return logits, None
 
 
+def test_wandb_logger_metric_definitions_are_accepted_by_the_sdk(tmp_path) -> None:
+    encoding = tiktoken.get_encoding("gpt2")
+    model = ScriptedGPT(
+        continuation_token=encoding.encode(" world")[0],
+        eot_token=encoding.eot_token,
+    )
+
+    with wandb.init(
+        project="wandb-logger-regression",
+        mode="offline",
+        dir=tmp_path,
+        settings=wandb.Settings(silent=True),
+    ) as run:
+        WandbEvaluationLogger(
+            run=run,
+            model=model,
+            encoding=encoding,
+            device="cpu",
+            validation_domains=("web", "math"),
+        )
+
+
 def test_wandb_logger_generates_a_fixed_prompt_table_only_at_its_interval() -> None:
     encoding = tiktoken.get_encoding("gpt2")
     model = ScriptedGPT(
@@ -155,11 +178,24 @@ def test_wandb_logger_generates_a_fixed_prompt_table_only_at_its_interval() -> N
         sample_interval=2,
         max_new_tokens=4,
         prompts=(EvaluationPrompt("test", "Hello"),),
+        validation_domains=("web", "math"),
     )
 
     assert (
         "validation/loss",
         {"step_metric": "trainer/global_step", "summary": "min"},
+    ) in run.defined
+    assert (
+        "validation/web/loss",
+        {"step_metric": "trainer/global_step", "summary": "min"},
+    ) in run.defined
+    assert (
+        "validation/math/perplexity",
+        {"step_metric": "trainer/global_step", "summary": "min"},
+    ) in run.defined
+    assert (
+        "validation/math/target_tokens",
+        {"step_metric": "trainer/global_step"},
     ) in run.defined
     logger.log_samples(step=0)
     logger(
