@@ -4,6 +4,13 @@ SHELL := /bin/bash
 .NOTPARALLEL:
 
 UV ?= uv
+UV_VERSION ?= 0.11.32
+UV_INSTALL_DIR ?= $(HOME)/.local/bin
+UV_INSTALL_URL ?= https://astral.sh/uv/$(UV_VERSION)/install.sh
+UV_CMD := PATH="$(UV_INSTALL_DIR):$$PATH" $(UV)
+GH ?= gh
+GH_HOST ?= github.com
+GH_AUTH ?= auto
 RECIPE ?= configs/pretrain_v1_english_12b.json
 WANDB_PROJECT ?= llm-from-scratch
 WANDB_ENTITY ?=
@@ -101,7 +108,7 @@ fi
 endef
 
 .PHONY: \
-	help setup local-gate gpu-check credentials-check validate-recipe runpod-ready \
+	help bootstrap-tools gh-auth setup local-gate gpu-check credentials-check validate-recipe runpod-ready \
 	prepare-data prepare-fineweb prepare-stack prepare-math-3 prepare-finewiki \
 	prepare-math-4plus prepare-fact \
 	a100-rehearsal-start a100-rehearsal-resume \
@@ -111,29 +118,96 @@ endef
 help: ## Show the available workflow targets.
 	@awk 'BEGIN {FS = ":.*## "}; /^[a-zA-Z0-9_.-]+:.*## / {printf "  %-26s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-setup: ## Install the locked project and development dependencies.
-	$(UV) python install
-	$(UV) sync --locked --group dev
+bootstrap-tools: ## Install the pinned uv and GitHub CLI when missing.
+	@set -eu; \
+	export UV_INSTALL_DIR="$(UV_INSTALL_DIR)"; \
+	export PATH="$(UV_INSTALL_DIR):$$PATH"; \
+	uv_version=""; \
+	if command -v "$(UV)" >/dev/null 2>&1; then \
+		uv_version="$$($(UV) --version | awk 'NR == 1 {print $$2}')"; \
+	fi; \
+	if [ "$$uv_version" != "$(UV_VERSION)" ]; then \
+		command -v curl >/dev/null 2>&1 || { echo "curl is required to install uv" >&2; exit 1; }; \
+		echo "Installing uv $(UV_VERSION) into $(UV_INSTALL_DIR)"; \
+		curl -LsSf "$(UV_INSTALL_URL)" | sh; \
+	fi; \
+	command -v "$(UV)" >/dev/null 2>&1 || { echo "uv was not found after installation; add $(UV_INSTALL_DIR) to PATH" >&2; exit 1; }; \
+	installed_uv_version="$$($(UV) --version | awk 'NR == 1 {print $$2}')"; \
+	[ "$$installed_uv_version" = "$(UV_VERSION)" ] || { echo "Expected uv $(UV_VERSION), found uv $$installed_uv_version" >&2; exit 1; }; \
+	if ! command -v "$(GH)" >/dev/null 2>&1; then \
+		if command -v brew >/dev/null 2>&1; then \
+			echo "Installing GitHub CLI with Homebrew"; \
+			brew install gh; \
+		elif command -v apt-get >/dev/null 2>&1; then \
+			echo "Installing GitHub CLI with apt"; \
+			if command -v sudo >/dev/null 2>&1; then \
+				sudo apt-get update; \
+				sudo apt-get install -y gh; \
+			else \
+				apt-get update; \
+				apt-get install -y gh; \
+			fi; \
+		else \
+			echo "Cannot install gh automatically: use Homebrew or apt-get, then rerun make setup" >&2; \
+			exit 1; \
+		fi; \
+	fi; \
+	command -v "$(GH)" >/dev/null 2>&1 || { echo "gh was not found after installation" >&2; exit 1; }
+
+gh-auth: bootstrap-tools ## Authenticate the GitHub CLI, or skip it explicitly.
+	@set -eu; \
+	export PATH="$(UV_INSTALL_DIR):$$PATH"; \
+	case "$(GH_AUTH)" in \
+		skip) \
+			echo "Skipping GitHub CLI authentication (GH_AUTH=skip)."; \
+			;; \
+		auto) \
+			if "$(GH)" auth status --hostname "$(GH_HOST)" >/dev/null 2>&1; then \
+				echo "GitHub CLI is already authenticated."; \
+			elif [ -n "$${GH_TOKEN:-}" ] || [ -n "$${GITHUB_TOKEN:-}" ]; then \
+				echo "Using GH_TOKEN/GITHUB_TOKEN for headless GitHub CLI authentication."; \
+			elif [ -t 0 ] && [ -t 1 ]; then \
+				echo "Starting interactive GitHub CLI login..."; \
+				"$(GH)" auth login --hostname "$(GH_HOST)" --git-protocol https --web; \
+			else \
+				echo "GitHub CLI is not authenticated and setup has no interactive terminal." >&2; \
+				echo "Set GH_TOKEN or GITHUB_TOKEN, run 'gh auth login', or use 'make setup GH_AUTH=skip'." >&2; \
+				exit 1; \
+			fi; \
+			"$(GH)" auth setup-git --hostname "$(GH_HOST)"; \
+			"$(GH)" auth status --hostname "$(GH_HOST)"; \
+			;; \
+		*) \
+			echo "GH_AUTH must be 'auto' or 'skip', got '$(GH_AUTH)'" >&2; \
+			exit 2; \
+			;; \
+	esac
+
+setup: gh-auth ## Bootstrap uv/gh, authenticate GitHub, and install locked dependencies.
+	@set -eu; \
+	export PATH="$(UV_INSTALL_DIR):$$PATH"; \
+	$(UV_CMD) python install; \
+	$(UV_CMD) sync --locked --group dev
 
 local-gate: ## Run all free correctness checks before renting a GPU.
-	$(UV) run pytest -q
-	$(UV) run ruff format --check src
-	$(UV) run ruff check src
-	$(UV) run mypy
+	$(UV_CMD) run pytest -q
+	$(UV_CMD) run ruff format --check src
+	$(UV_CMD) run ruff check src
+	$(UV_CMD) run mypy
 
 gpu-check: ## Verify that PyTorch sees one BF16-capable CUDA GPU.
 	@nvidia-smi
-	@$(UV) run python -c 'import sys, torch; cuda=torch.cuda.is_available(); sys.exit("CUDA is unavailable") if not cuda else None; bf16=torch.cuda.is_bf16_supported(); sys.exit("GPU does not support BF16") if not bf16 else None; print(f"torch={torch.__version__} gpu={torch.cuda.get_device_name(0)} bf16=True")'
+	@$(UV_CMD) run python -c 'import sys, torch; cuda=torch.cuda.is_available(); sys.exit("CUDA is unavailable") if not cuda else None; bf16=torch.cuda.is_bf16_supported(); sys.exit("GPU does not support BF16") if not bf16 else None; print(f"torch={torch.__version__} gpu={torch.cuda.get_device_name(0)} bf16=True")'
 
 credentials-check: ## Verify the RunPod secret environment variables without printing them.
-	@$(UV) run python -c 'import os, sys; required=("HF_TOKEN", "WANDB_API_KEY"); missing=[name for name in required if not os.environ.get(name)]; sys.exit(f"Missing secret environment variables: {missing}") if missing else print("HF_TOKEN and WANDB_API_KEY are configured")'
+	@$(UV_CMD) run python -c 'import os, sys; required=("HF_TOKEN", "WANDB_API_KEY"); missing=[name for name in required if not os.environ.get(name)]; sys.exit(f"Missing secret environment variables: {missing}") if missing else print("HF_TOKEN and WANDB_API_KEY are configured")'
 
 prepare-data: $(DATA_MANIFESTS) ## Prepare all six pinned datasets, skipping completed manifests.
 
 prepare-fineweb: $(FINEWEB_MANIFEST) ## Prepare the FineWeb-Edu sample-10BT source.
 
 $(FINEWEB_MANIFEST):
-	$(UV) run prepare-data prepare \
+	$(UV_CMD) run prepare-data prepare \
 		--dataset-name HuggingFaceFW/fineweb-edu \
 		--name sample-10BT \
 		--revision 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9 \
@@ -151,7 +225,7 @@ $(FINEWEB_MANIFEST):
 prepare-stack: $(STACK_MANIFEST) ## Prepare permissively licensed Python from Stack v3.
 
 $(STACK_MANIFEST):
-	$(UV) run prepare-data prepare \
+	$(UV_CMD) run prepare-data prepare \
 		--dataset-name HuggingFaceCode/stack-v3-train \
 		--revision 2b4797afd5677e32630c2247a6a8092e1a5afa03 \
 		--split train \
@@ -172,7 +246,7 @@ $(STACK_MANIFEST):
 prepare-math-3: $(MATH_3_MANIFEST) ## Prepare the broad Nemotron mathematics source.
 
 $(MATH_3_MANIFEST):
-	$(UV) run prepare-data prepare \
+	$(UV_CMD) run prepare-data prepare \
 		--dataset-name nvidia/Nemotron-CC-Math-v1 \
 		--name 3 \
 		--revision 397a2502f2028c659ba411a6c4935b464a7f03aa \
@@ -191,7 +265,7 @@ $(MATH_3_MANIFEST):
 prepare-finewiki: $(FINEWIKI_MANIFEST) ## Prepare the English FineWiki knowledge source.
 
 $(FINEWIKI_MANIFEST):
-	$(UV) run prepare-data prepare \
+	$(UV_CMD) run prepare-data prepare \
 		--dataset-name HuggingFaceFW/finewiki \
 		--name en \
 		--revision 8bd13e72e6a002407649b3e898535f42ceb1aeb9 \
@@ -209,7 +283,7 @@ $(FINEWIKI_MANIFEST):
 prepare-math-4plus: $(MATH_4PLUS_MANIFEST) ## Prepare premium Nemotron mathematics for WSD decay.
 
 $(MATH_4PLUS_MANIFEST):
-	$(UV) run prepare-data prepare \
+	$(UV_CMD) run prepare-data prepare \
 		--dataset-name nvidia/Nemotron-CC-Math-v1 \
 		--name 4plus \
 		--revision 397a2502f2028c659ba411a6c4935b464a7f03aa \
@@ -228,7 +302,7 @@ $(MATH_4PLUS_MANIFEST):
 prepare-fact: $(FACT_MANIFEST) ## Prepare premium fact-seeking data for WSD decay.
 
 $(FACT_MANIFEST):
-	$(UV) run prepare-data prepare \
+	$(UV_CMD) run prepare-data prepare \
 		--dataset-name nvidia/Nemotron-Pretraining-Specialized-v1.2 \
 		--name Nemotron-Pretraining-Fact-Seeking \
 		--revision 807afc1fa65c441d46ebc7d9b95295a35499a527 \
@@ -244,21 +318,21 @@ $(FACT_MANIFEST):
 		--encoding gpt2
 
 validate-recipe: ## Validate manifests, tokenizer agreement, quotas, and source capacity.
-	@$(UV) run python -c 'from src.data.dataset import PretrainingDataset; from src.data.mixture import DeterministicMixtureSampler, MixtureDataset; from src.data.recipe import load_training_recipe; recipe=load_training_recipe("$(RECIPE)"); datasets={source.name: PretrainingDataset(source.manifest_path, "train", $(SEQ_LEN)) for source in recipe.sources}; mixture=MixtureDataset(datasets); sampler=DeterministicMixtureSampler(mixture, recipe.phases, $(SEQ_LEN), 42); print(f"recipe={recipe.name} seq_len=$(SEQ_LEN) tokens={recipe.total_tokens:,} sequences={len(sampler):,} sources={len(recipe.sources)}")'
+	@$(UV_CMD) run python -c 'from src.data.dataset import PretrainingDataset; from src.data.mixture import DeterministicMixtureSampler, MixtureDataset; from src.data.recipe import load_training_recipe; recipe=load_training_recipe("$(RECIPE)"); datasets={source.name: PretrainingDataset(source.manifest_path, "train", $(SEQ_LEN)) for source in recipe.sources}; mixture=MixtureDataset(datasets); sampler=DeterministicMixtureSampler(mixture, recipe.phases, $(SEQ_LEN), 42); print(f"recipe={recipe.name} seq_len=$(SEQ_LEN) tokens={recipe.total_tokens:,} sequences={len(sampler):,} sources={len(recipe.sources)}")'
 
 runpod-ready: local-gate gpu-check credentials-check validate-recipe ## Run every check required immediately before a paid training job.
 
 a100-rehearsal-start: runpod-ready ## Run steps 1-250 of the resumability rehearsal.
 	$(call ensure_new_checkpoint_dir,$(A100_CHECKPOINT_DIR))
-	$(UV) run train-v1 $(MODEL_ARGS) $(RUNTIME_ARGS) $(A100_REHEARSAL_ARGS) \
+	$(UV_CMD) run train-v1 $(MODEL_ARGS) $(RUNTIME_ARGS) $(A100_REHEARSAL_ARGS) \
 		--stop-after-step 250
 
 a100-rehearsal-resume: runpod-ready ## Resume the rehearsal from step 250 through step 500.
-	$(UV) run train-v1 $(MODEL_ARGS) $(RUNTIME_ARGS) $(A100_REHEARSAL_ARGS) --resume latest
+	$(UV_CMD) run train-v1 $(MODEL_ARGS) $(RUNTIME_ARGS) $(A100_REHEARSAL_ARGS) --resume latest
 
 define run_sweep
 	$(call ensure_new_checkpoint_dir,checkpoints/v1-lr-$(2))
-	$(UV) run train-v1 $(MODEL_ARGS) $(RUNTIME_ARGS) $(A100_BATCH_ARGS) \
+	$(UV_CMD) run train-v1 $(MODEL_ARGS) $(RUNTIME_ARGS) $(A100_BATCH_ARGS) \
 		--max-steps 572 \
 		--warmup-steps 50 \
 		--max-learning-rate $(1) \
@@ -271,7 +345,7 @@ define run_sweep
 endef
 
 define resume_sweep
-	$(UV) run train-v1 $(MODEL_ARGS) $(RUNTIME_ARGS) $(A100_BATCH_ARGS) \
+	$(UV_CMD) run train-v1 $(MODEL_ARGS) $(RUNTIME_ARGS) $(A100_BATCH_ARGS) \
 		--max-steps 572 \
 		--warmup-steps 50 \
 		--max-learning-rate $(1) \
@@ -304,7 +378,7 @@ sweep-1e3-resume: runpod-ready ## Resume the 1e-3 LR candidate.
 
 h100-train: runpod-ready ## Start the final 12B-token H100 run with MAX_LEARNING_RATE.
 	$(call ensure_new_checkpoint_dir,$(H100_CHECKPOINT_DIR))
-	$(UV) run train-v1 $(MODEL_ARGS) $(RUNTIME_ARGS) $(H100_TRAIN_ARGS)
+	$(UV_CMD) run train-v1 $(MODEL_ARGS) $(RUNTIME_ARGS) $(H100_TRAIN_ARGS)
 
 h100-resume: runpod-ready ## Resume the final H100 run from its newest valid checkpoint.
-	$(UV) run train-v1 $(MODEL_ARGS) $(RUNTIME_ARGS) $(H100_TRAIN_ARGS) --resume latest
+	$(UV_CMD) run train-v1 $(MODEL_ARGS) $(RUNTIME_ARGS) $(H100_TRAIN_ARGS) --resume latest

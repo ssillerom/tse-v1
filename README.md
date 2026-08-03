@@ -32,10 +32,23 @@ shards, mezcla de datos, entrenamiento, evaluación y reanudación sin depender 
 
 ## Instalación
 
-Requiere Python 3.13 y [uv](https://docs.astral.sh/uv/).
+`make setup` instala (si faltan) la versión fijada de [uv](https://docs.astral.sh/uv/), la
+GitHub CLI y las dependencias bloqueadas del proyecto. También comprueba la sesión de GitHub:
+usa `GH_TOKEN`/`GITHUB_TOKEN` si están definidos o inicia el flujo interactivo en un terminal.
 
 ```bash
-uv sync --group dev
+make setup
+export PATH="${UV_INSTALL_DIR:-$HOME/.local/bin}:$PATH"
+```
+
+Las recetas de Make ya anteponen automáticamente `UV_INSTALL_DIR`; el `export` sólo hace que
+los comandos `uv` escritos directamente en este terminal también estén disponibles.
+
+Si no quieres iniciar sesión en GitHub en ese equipo (la CLI se instalará igualmente):
+
+```bash
+make setup GH_AUTH=skip
+export PATH="${UV_INSTALL_DIR:-$HOME/.local/bin}:$PATH"
 ```
 
 ## Prueba con 50 documentos de FineWeb-Edu

@@ -33,6 +33,11 @@ WANDB_DIR=/workspace/wandb
 TRAINING_COMMIT=<commit SHA pushed from the local repository>
 ```
 
+For a non-interactive bootstrap, also map `GH_TOKEN` (or `GITHUB_TOKEN`) to a short-lived
+GitHub token with the minimum repository permissions needed for `git fetch`. Otherwise,
+`make setup` starts the interactive GitHub CLI device login over SSH. Do not commit or print
+any of these secret values.
+
 Use an immutable tag of the official RunPod PyTorch image rather than `latest`, and record
 that tag with the experiment. Select a machine whose driver supports CUDA 13.0, which is
 required by the locked PyTorch build. Keep at least 30 GB of container disk, attach the
@@ -51,15 +56,17 @@ git fetch origin
 git checkout --detach "$TRAINING_COMMIT"
 test "$(git rev-parse HEAD)" = "$TRAINING_COMMIT"
 
-curl -LsSf https://astral.sh/uv/0.11.32/install.sh | sh
-source "$HOME/.local/bin/env"
-
 make setup
+export PATH="${UV_INSTALL_DIR:-$HOME/.local/bin}:$PATH"
 make local-gate
 ```
 
-`uv` installs the Python version pinned by the project, creates `.venv`, and installs the
-locked dependencies. `make local-gate` must pass before paying for GPU time.
+`make setup` installs the pinned `uv` release into `$HOME/.local/bin` when needed, installs the
+GitHub CLI with Homebrew or apt when needed, authenticates it, installs the Python version
+pinned by the project, creates `.venv`, and installs the locked dependencies. `make local-gate`
+must pass before paying for GPU time. The `export` makes direct `uv` commands in the current
+shell available; Make targets set the path themselves. The bootstrap is idempotent, so rerunning
+it after reconnecting to a new Pod is safe.
 
 ## 3. Prepare the 12B-token data
 
