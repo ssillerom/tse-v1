@@ -510,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # Restore the eager FP32 model and optimizer before optionally compiling
-    # the training wrapper; checkpoints always serialize the eager module.
+    # the same module in place; checkpoints keep the normal module structure.
     model = GPT(model_config).to(device)
     optimizer = torch.optim.AdamW(
         build_adamw_parameter_groups(model, weight_decay=arguments.weight_decay),
@@ -526,18 +526,12 @@ def main(argv: list[str] | None = None) -> int:
         training_config=training_config,
         run_config=run_config,
     )
-    training_model = (
-        model
-        if compile_mode is None
-        else cast(
-            GPT,
-            torch.compile(
-                model,
-                mode=compile_mode,
-                dynamic=False,
-            ),
+    if compile_mode is not None:
+        model.compile(
+            mode=compile_mode,
+            dynamic=False,
         )
-    )
+    training_model = model
     start_step = 0 if restored_checkpoint is None else restored_checkpoint.step
     training_inputs = build_training_inputs(
         bundle=dataset_bundle,

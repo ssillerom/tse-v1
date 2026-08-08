@@ -1,11 +1,12 @@
 # V1 English 12B training run
 
-This is the operational recipe for the educational 353M V1. It deliberately keeps the
+This is the operational recipe for the educational 315.8M V1. It deliberately keeps the
 training system single-device and uses staged proofs before renting the final H100 SXM.
 
 ## Fixed model and token budget
 
-- 353M parameters: `d_model=1024`, 24 layers, 16 MHA heads.
+- 315,753,472 parameters: `d_model=1024`, 24 layers, 16 query heads and 4 key/value heads
+  (GQA, four Q heads per K/V head).
 - Context length: 2,048.
 - GPT-2 `tiktoken` vocabulary padded to 50,304.
 - Global batch: 256 sequences = 524,288 tokens per optimizer step.
@@ -15,6 +16,8 @@ training system single-device and uses staged proofs before renting the final H1
 - AdamW: betas `(0.9, 0.95)`, epsilon `1e-8`, weight decay `0.1` only on matrix
   parameters, gradient clipping at `1.0`.
 - BF16 forward/backward with FP32 parameters and optimizer state.
+- Incremental generation keeps only the four K/V heads per layer in its compact KV cache. When
+  the cache reaches 2,048 tokens, generation rebuilds it from the most recent context window.
 - WSD: 400 warmup steps, stable LR, then cosine decay beginning at step 20,599 and
   reaching zero on the final update.
 
@@ -200,7 +203,7 @@ The important behavioural proofs are:
 
 ## Gate 2: A100 full-model rehearsal
 
-Use an A100 for the first paid run. This is not a tiny-model test: it uses the final 353M
+Use an A100 for the first paid run. This is not a tiny-model test: it uses the final 315.8M
 architecture, context, precision and global token batch. Start with micro-batch 4 and
 accumulation 64. If it is comfortably below VRAM, use 8 × 32 instead.
 
@@ -212,6 +215,7 @@ uv run train-v1 \
   --d-model 1024 \
   --n-layers 24 \
   --n-heads 16 \
+  --n-kv-heads 4 \
   --seq-len 2048 \
   --batch-size 4 \
   --grad-accum-steps 64 \
@@ -251,21 +255,23 @@ The command intentionally exits at step 250. Run it again after removing
 `--stop-after-step 250` and adding `--resume latest`; it must finish at step 500. Do not
 change model, optimizer, batch, schedule, recipe or seed.
 
-### Torch compilation A/B
+### Torch compilation
 
 The architecture is a plausible `torch.compile` candidate: training shapes are fixed, the
 attention path uses SDPA, and RoPE avoids complex tensors. Compilation is nevertheless a
 hardware- and shape-specific optimization, not part of model correctness.
 
-Run two otherwise identical rehearsals in fresh checkpoint directories:
+Every Make training target enables compilation by default through
+`TORCH_COMPILE_ARGS="--compile --compile-mode default"`. To compare eager and compiled runs,
+use fresh checkpoint directories:
 
 ```bash
 make a100-rehearsal-start \
-  A100_RUN_NAME=v1-a100-eager
+  A100_RUN_NAME=v1-a100-eager \
+  TORCH_COMPILE_ARGS=
 
 make a100-rehearsal-start \
-  A100_RUN_NAME=v1-a100-compile \
-  TORCH_COMPILE_ARGS="--compile --compile-mode default"
+  A100_RUN_NAME=v1-a100-compile
 ```
 
 Ignore the compiled run's first steps when comparing throughput because they include JIT
@@ -309,6 +315,7 @@ uv run train-v1 \
   --d-model 1024 \
   --n-layers 24 \
   --n-heads 16 \
+  --n-kv-heads 4 \
   --seq-len 2048 \
   --batch-size 8 \
   --grad-accum-steps 32 \

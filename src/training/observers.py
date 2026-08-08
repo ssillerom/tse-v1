@@ -9,9 +9,9 @@ import torch
 from src.data.mixture import DeterministicMixtureSampler
 from src.model.gpt import GPT
 
-from .checkpoint import TrainingRunConfig, save_checkpoint
-from .trainer import StepMetrics, TrainingConfig
-from .wandb_logging import WandbEvaluationLogger
+from src.training.checkpoint import TrainingRunConfig, save_checkpoint
+from src.training.trainer import StepMetrics, TrainingConfig
+from src.training.wandb_logging import WandbEvaluationLogger
 
 
 @dataclass

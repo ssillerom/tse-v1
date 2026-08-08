@@ -25,7 +25,7 @@ manifests, sequence length, tokenizer, batch limit, and recipe unchanged when co
 
 `best_validation.pt` is atomically replaced only when the aggregate validation loss improves.
 Numbered `step_*.pt` files remain the resumable chronology and follow `--keep-last-checkpoints`;
-the best checkpoint is retained independently. Each v6 checkpoint stores both the loss of its
+the best checkpoint is retained independently. Each v7 checkpoint stores both the loss of its
 own weights, when evaluated, and the best loss observed so far so selection survives resume.
 
 ## 2. Controlled data-mixture baseline
@@ -37,8 +37,9 @@ The 300M-token recipes provide a cheap controlled comparison:
 
 Both contain exactly 146,432 sequences, or 299,892,736 tokens at context length 2,048. Train
 them with the same architecture, seed, optimizer, LR, batch, precision, and hardware. The
-only intended difference is the data distribution. Use independent checkpoint directories
-and W&B names.
+only intended difference is the data distribution. Use the production GQA shape—16 query
+heads and 4 key/value heads, with four Q heads per K/V head—and independent checkpoint
+directories and W&B names.
 
 Start from the same argument template for both runs and change only `--recipe`,
 `--checkpoint-dir`, and `--wandb-name`:
@@ -51,6 +52,7 @@ uv run train-v1 \
   --d-model 1024 \
   --n-layers 24 \
   --n-heads 16 \
+  --n-kv-heads 4 \
   --seq-len 2048 \
   --batch-size 4 \
   --grad-accum-steps 64 \

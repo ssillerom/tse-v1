@@ -19,7 +19,7 @@ NUM_WORKERS ?= 4
 PREPARE_WORKERS ?= 2
 PREPARE_SOURCE_WORKERS ?= 2
 MAX_LEARNING_RATE ?= 0.0006
-TORCH_COMPILE_ARGS ?=
+TORCH_COMPILE_ARGS ?= --compile --compile-mode default
 SEQ_LEN := 2048
 A100_BATCH_SIZE ?= 4
 A100_GRAD_ACCUM_STEPS ?= 64
@@ -228,7 +228,7 @@ prepare-stack: $(STACK_MANIFEST) ## Prepare permissively licensed Python from St
 $(STACK_MANIFEST):
 	$(UV_CMD) run prepare-data prepare \
 		--dataset-name HuggingFaceCode/stack-v3-train \
-		--revision 2b4797afd5677e32630c2247a6a8092e1a5afa03 \
+		--revision 80a7f793eb87d89a7835c3585090427039da0ad3 \
 		--split train \
 		--records-field files \
 		--record-filter language=Python,license_type=permissive \

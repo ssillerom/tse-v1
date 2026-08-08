@@ -18,10 +18,10 @@ El pipeline de datos ya permite:
 - producir pares `(input_ids, targets)` para causal language modeling;
 - inspeccionar las ventanas como IDs y texto decodificado.
 
-El modelo V1 ya incluye embeddings, bloques Pre-Norm con MHA o GQA + RoPE, RMSNorm, SwiGLU,
-pesos compartidos con el `lm_head` y causal cross-entropy. La generación incremental conserva
-una KV cache compacta por capa. Un smoke test pequeño verifica formas, causalidad, gradientes y
-que el modelo puede sobreajustar un batch dependiente del contexto.
+El modelo V1 ya incluye embeddings, bloques Pre-Norm con atención MHA o GQA + RoPE, RMSNorm,
+SwiGLU, pesos compartidos con el `lm_head` y causal cross-entropy. La generación incremental
+conserva una KV cache compacta por capa. Un smoke test pequeño verifica formas, causalidad,
+gradientes y que el modelo puede sobreajustar un batch dependiente del contexto.
 
 El módulo de entrenamiento añade grupos AdamW con weight decay selectivo, acumulación de
 gradientes ponderada por tokens, gradient clipping, warmup lineal con cosine decay o WSD,
@@ -161,11 +161,11 @@ uv run train-v1 \
   --wandb-name v1-smoke-001
 ```
 
-La atención usa MHA cuando se omite `--n-kv-heads`. Para activar GQA, indica un divisor de
-`--n-heads`; por ejemplo, `--n-heads 8 --n-kv-heads 2` hace que cada head K/V sea compartido por
-cuatro heads Q. El valor `1` selecciona MQA. Las muestras greedy y la generación del evaluation
-harness usan automáticamente la KV cache compacta y la reconstruyen cuando alcanzan el límite
-de contexto.
+La atención usa MHA cuando se omite `--n-kv-heads`. La receta de entrenamiento fija
+`--n-heads 16 --n-kv-heads 4`: cada head K/V es compartido por cuatro heads Q (relación 4:1).
+En general, `--n-kv-heads` debe dividir a `--n-heads`; el valor `1` selecciona MQA. La KV cache
+compacta guarda sólo las cabezas K/V, y las muestras greedy y la generación del evaluation
+harness la reconstruyen con los últimos tokens cuando alcanzan el límite de contexto.
 
 Los prompts son fijos durante toda la ejecución para poder comparar checkpoints sin introducir
 azar de sampling. La evaluación frecuente usa como máximo `--eval-batches 20`, seleccionados
@@ -179,8 +179,9 @@ forward y backward.
 
 Con una recipe multifuente, W&B registra loss, perplexity y tokens evaluados para cada fuente,
 además de un agregado ponderado con las proporciones completas de la recipe. `torch.compile`
-está disponible de forma opcional en CUDA mediante `--compile`; debe compararse contra eager
-en un rehearsal y conservarse idéntico al reanudar.
+está disponible en CUDA mediante `--compile`; los targets de entrenamiento de Make lo activan
+por defecto con `--compile --compile-mode default`. Para una ejecución eager explícita, usa
+`TORCH_COMPILE_ARGS=`; la elección debe conservarse idéntica al reanudar.
 
 Por defecto se conservan sólo los tres checkpoints numerados con mayor step. Además,
 `best_validation.pt` conserva siempre las ponderaciones con menor `validation/loss`; no está
