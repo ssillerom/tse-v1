@@ -122,14 +122,21 @@ def generate_greedy(
     generated = input_ids
     try:
         with torch.inference_mode():
-            for _ in range(max_new_tokens):
-                context = generated[:, -model.config.max_seq_len :]
-                logits, _ = model(context)
+            context = generated[:, -model.config.max_seq_len :]
+            logits, cache = model.forward_with_cache(context)
+            for token_index in range(max_new_tokens):
                 next_token_logits = logits[:, -1, :tokenizer_vocab_size]
                 next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                 generated = torch.cat((generated, next_token), dim=1)
                 if next_token.item() == eot_token_id:
                     break
+                if token_index + 1 == max_new_tokens:
+                    break
+                if cache.seq_len == model.config.max_seq_len:
+                    context = generated[:, -model.config.max_seq_len :]
+                    logits, cache = model.forward_with_cache(context)
+                else:
+                    logits, cache = model.forward_with_cache(next_token, cache)
     finally:
         model.train(was_training)
     return generated

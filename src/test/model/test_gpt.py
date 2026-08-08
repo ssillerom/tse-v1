@@ -3,8 +3,9 @@ import math
 import pytest
 import torch
 
+from model.attention import AttentionKVCache
 from model.config import ModelConfig
-from model.gpt import GPT
+from model.gpt import GPT, GPTKVCache
 
 
 def test_gpt_converts_token_sequences_into_vocabulary_logits() -> None:
@@ -23,6 +24,24 @@ def test_gpt_converts_token_sequences_into_vocabulary_logits() -> None:
 
     assert logits.shape == (2, 6, config.vocab_size)
     assert loss is None
+
+
+def test_gpt_propagates_grouped_query_attention_to_every_block() -> None:
+    base_settings = {
+        "vocab_size": 32,
+        "d_model": 16,
+        "n_layers": 2,
+        "n_heads": 4,
+        "max_seq_len": 8,
+        "dropout": 0.0,
+    }
+    mha = GPT(ModelConfig(**base_settings))
+    gqa = GPT(ModelConfig(**base_settings, n_kv_heads=2))
+
+    mha_parameter_count = sum(parameter.numel() for parameter in mha.parameters())
+    gqa_parameter_count = sum(parameter.numel() for parameter in gqa.parameters())
+
+    assert mha_parameter_count - gqa_parameter_count == 512
 
 
 def test_gpt_can_use_manual_attention_without_calling_sdpa(
@@ -244,3 +263,53 @@ def test_gpt_rejects_non_long_token_ids_and_targets() -> None:
 
     with pytest.raises(ValueError, match="targets must have dtype torch.long"):
         model(long_ids, float_ids)
+
+
+@pytest.mark.parametrize("use_sdpa", [False, True])
+def test_gpt_kv_cache_matches_one_shot_logits(use_sdpa: bool) -> None:
+    torch.manual_seed(42)
+    config = ModelConfig(
+        vocab_size=32,
+        d_model=16,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        max_seq_len=8,
+        dropout=0.0,
+        use_sdpa=use_sdpa,
+    )
+    model = GPT(config)
+    model.eval()
+    input_ids = torch.randint(0, config.vocab_size, (2, 6))
+
+    expected_logits, _ = model(input_ids)
+    prefix_logits, cache = model.forward_with_cache(input_ids[:, :4])
+    suffix_logits, cache = model.forward_with_cache(input_ids[:, 4:], cache)
+
+    torch.testing.assert_close(
+        torch.cat((prefix_logits, suffix_logits), dim=1),
+        expected_logits,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert cache.seq_len == 6
+    assert len(cache.layers) == config.n_layers
+
+
+def test_gpt_rejects_malformed_kv_cache_with_an_explicit_error() -> None:
+    config = ModelConfig(
+        vocab_size=16,
+        d_model=16,
+        n_layers=1,
+        n_heads=4,
+        n_kv_heads=2,
+        max_seq_len=8,
+    )
+    model = GPT(config)
+    malformed_tensor = torch.zeros(1, 2)
+    malformed_cache = GPTKVCache(
+        (AttentionKVCache(key=malformed_tensor, value=malformed_tensor.clone()),)
+    )
+
+    with pytest.raises(ValueError, match="cache must have shape"):
+        model.forward_with_cache(torch.tensor([[1]], dtype=torch.long), malformed_cache)

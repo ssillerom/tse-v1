@@ -36,3 +36,16 @@ def test_model_config_rejects_invalid_public_settings(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         ModelConfig(**kwargs)
+
+
+@pytest.mark.parametrize("n_kv_heads", [0, -1, 2.0, True])
+def test_model_config_rejects_invalid_key_value_head_counts(
+    n_kv_heads: object,
+) -> None:
+    with pytest.raises(ValueError, match="n_kv_heads must be a positive integer"):
+        ModelConfig(n_heads=8, n_kv_heads=n_kv_heads)  # type: ignore[arg-type]
+
+
+def test_model_config_requires_query_heads_to_split_evenly_across_key_value_heads() -> None:
+    with pytest.raises(ValueError, match="n_heads .* divisible by n_kv_heads"):
+        ModelConfig(n_heads=8, n_kv_heads=3)

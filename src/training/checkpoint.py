@@ -17,8 +17,8 @@ from src.model.gpt import GPT
 from .rng import TorchRngSnapshot, capture_torch_rng_state, restore_torch_rng_state
 from .trainer import TrainingConfig
 
-CHECKPOINT_FORMAT_VERSION = 6
-SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = frozenset({1, 2, 3, 4, 5, CHECKPOINT_FORMAT_VERSION})
+CHECKPOINT_FORMAT_VERSION = 7
+SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, CHECKPOINT_FORMAT_VERSION})
 CHECKPOINT_FILENAME_PATTERN = re.compile(r"step_(\d+)\.pt\Z")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -322,6 +322,9 @@ def restore_checkpoint(
         raise ValueError("checkpoint contains an invalid model_config")
     if not isinstance(saved_training_config, dict):
         raise ValueError("checkpoint contains an invalid training_config")
+    model_config = dict(model_config)
+    if format_version <= 6:
+        model_config.setdefault("n_kv_heads", None)
     saved_training_config = dict(saved_training_config)
     if format_version == 1:
         saved_training_config.setdefault("precision", "fp32")

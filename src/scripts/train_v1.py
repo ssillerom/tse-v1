@@ -88,6 +88,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--n-heads", type=int, default=8)
+    parser.add_argument(
+        "--n-kv-heads",
+        type=int,
+        help="key/value attention heads; defaults to --n-heads for standard MHA",
+    )
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.0)
 
@@ -352,6 +357,7 @@ def _build_model_config(arguments: argparse.Namespace) -> ModelConfig:
         d_model=arguments.d_model,
         n_layers=arguments.n_layers,
         n_heads=arguments.n_heads,
+        n_kv_heads=arguments.n_kv_heads,
         max_seq_len=arguments.seq_len,
         dropout=arguments.dropout,
         use_sdpa=True,

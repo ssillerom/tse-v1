@@ -18,6 +18,7 @@ class ModelConfig:
     norm_eps: float = 1e-6
     tie_embeddings: bool = True
     use_sdpa: bool = True
+    n_kv_heads: int | None = None  # If set, overrides n_heads for key/value projections.
 
     def __post_init__(self) -> None:
         integer_settings = {
@@ -30,6 +31,19 @@ class ModelConfig:
         for name, value in integer_settings.items():
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+        if self.n_kv_heads is not None and (
+            not isinstance(self.n_kv_heads, int)
+            or isinstance(self.n_kv_heads, bool)
+            or self.n_kv_heads <= 0
+        ):
+            raise ValueError(
+                f"n_kv_heads must be a positive integer or None, got {self.n_kv_heads!r}"
+            )
+        if self.n_kv_heads is not None and self.n_heads % self.n_kv_heads != 0:
+            raise ValueError(
+                f"n_heads {self.n_heads} must be divisible by n_kv_heads {self.n_kv_heads}"
+            )
 
         head_dim = self.head_dim()
         if head_dim % 2 != 0:

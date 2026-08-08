@@ -34,6 +34,26 @@ def test_sdpa_matches_manual_attention_with_the_same_weights() -> None:
     torch.testing.assert_close(sdpa_output, manual_output, atol=1e-6, rtol=1e-5)
 
 
+def test_sdpa_matches_manual_grouped_query_attention() -> None:
+    torch.manual_seed(42)
+    settings = {
+        "d_model": 16,
+        "n_heads": 4,
+        "n_kv_heads": 2,
+        "max_seq_len": 6,
+        "dropout": 0.0,
+    }
+    manual_attention = MultiHeadAttention(**settings, use_sdpa=False)
+    sdpa_attention = MultiHeadAttention(**settings, use_sdpa=True)
+    sdpa_attention.load_state_dict(manual_attention.state_dict())
+    inputs = torch.randn(2, 6, 16)
+
+    manual_output = manual_attention(inputs)
+    sdpa_output = sdpa_attention(inputs)
+
+    torch.testing.assert_close(sdpa_output, manual_output, atol=1e-6, rtol=1e-5)
+
+
 @pytest.mark.parametrize("use_sdpa", [False, True])
 def test_attention_dropout_follows_the_module_training_mode(use_sdpa: bool) -> None:
     torch.manual_seed(42)

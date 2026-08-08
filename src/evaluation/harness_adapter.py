@@ -11,7 +11,7 @@ import tiktoken
 import torch
 
 from src.model.config import ModelConfig
-from src.model.gpt import GPT
+from src.model.gpt import GPT, GPTKVCache
 from src.training.checkpoint import SUPPORTED_CHECKPOINT_FORMAT_VERSIONS
 
 try:
@@ -100,6 +100,7 @@ class _GenerationState:
     stop_sequences: tuple[str, ...]
     max_new_tokens: int
     result: str | None = None
+    cache: GPTKVCache | None = None
 
 
 class GPT2HarnessAdapter(_HarnessLM):  # type: ignore[misc]
@@ -246,7 +247,7 @@ class GPT2HarnessAdapter(_HarnessLM):  # type: ignore[misc]
         requests: list[HarnessRequest],
         disable_tqdm: bool = False,
     ) -> list[str]:
-        """Generate greedy continuations in batches and stop before requested strings."""
+        """Generate greedy continuations with per-request K/V caches."""
         del disable_tqdm
         states = [self._generation_state(request) for request in requests]
         was_training = self.model.training
@@ -325,49 +326,55 @@ class GPT2HarnessAdapter(_HarnessLM):  # type: ignore[misc]
         states: list[_GenerationState],
         batch_indices: list[int],
     ) -> None:
-        contexts = [
-            (states[index].context_ids + states[index].generated_ids)[
-                -self.model.config.max_seq_len :
-            ]
-            for index in batch_indices
-        ]
-        lengths = [len(context) for context in contexts]
-        max_length = max(lengths)
-        input_ids = torch.full(
-            (len(contexts), max_length),
-            self.encoding.eot_token,
-            dtype=torch.long,
-            device=self._device,
-        )
-        for row, context in enumerate(contexts):
-            input_ids[row, : len(context)] = torch.tensor(
-                context,
+        groups: dict[tuple[int | None, int], list[tuple[int, list[int]]]] = {}
+        for state_index in batch_indices:
+            state = states[state_index]
+            all_ids = state.context_ids + state.generated_ids
+            if state.cache is None or state.cache.seq_len == self.model.config.max_seq_len:
+                model_ids = all_ids[-self.model.config.max_seq_len :]
+                state.cache = None
+            else:
+                model_ids = all_ids[-1:]
+            cache_length = None if state.cache is None else state.cache.seq_len
+            groups.setdefault((cache_length, len(model_ids)), []).append((state_index, model_ids))
+
+        for group in groups.values():
+            input_ids = torch.tensor(
+                [model_ids for _, model_ids in group],
                 dtype=torch.long,
                 device=self._device,
             )
-        with self._precision_context():
-            logits, _ = self.model(input_ids)
-        row_indices = torch.arange(len(contexts), device=self._device)
-        position_indices = torch.tensor(lengths, device=self._device) - 1
-        next_logits = logits[
-            row_indices,
-            position_indices,
-            : self.encoding.n_vocab,
-        ]
-        next_ids = torch.argmax(next_logits, dim=-1).tolist()
+            group_caches = [states[state_index].cache for state_index, _ in group]
+            batched_cache = (
+                None
+                if group_caches[0] is None
+                else GPTKVCache.batch(cast(list[GPTKVCache], group_caches))
+            )
+            with self._precision_context():
+                logits, updated_cache = self.model.forward_with_cache(input_ids, batched_cache)
+            split_caches = updated_cache.unbind()
+            next_ids = torch.argmax(logits[:, -1, : self.encoding.n_vocab], dim=-1).tolist()
 
-        for state_index, token_id in zip(batch_indices, next_ids, strict=True):
-            state = states[state_index]
-            if token_id == self.encoding.eot_token:
-                state.result = self.encoding.decode(state.generated_ids)
-                continue
-            state.generated_ids.append(token_id)
-            decoded = self.encoding.decode(state.generated_ids)
-            stop_positions = [
-                position for stop in state.stop_sequences if (position := decoded.find(stop)) >= 0
-            ]
-            if stop_positions:
-                state.result = decoded[: min(stop_positions)]
+            for (state_index, _), request_cache, token_id in zip(
+                group,
+                split_caches,
+                next_ids,
+                strict=True,
+            ):
+                state = states[state_index]
+                state.cache = request_cache
+                if token_id == self.encoding.eot_token:
+                    state.result = self.encoding.decode(state.generated_ids)
+                    continue
+                state.generated_ids.append(token_id)
+                decoded = self.encoding.decode(state.generated_ids)
+                stop_positions = [
+                    position
+                    for stop in state.stop_sequences
+                    if (position := decoded.find(stop)) >= 0
+                ]
+                if stop_positions:
+                    state.result = decoded[: min(stop_positions)]
 
     def _score_windows(
         self,

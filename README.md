@@ -18,9 +18,10 @@ El pipeline de datos ya permite:
 - producir pares `(input_ids, targets)` para causal language modeling;
 - inspeccionar las ventanas como IDs y texto decodificado.
 
-El modelo V1 ya incluye embeddings, bloques Pre-Norm con MHA + RoPE, RMSNorm, SwiGLU, pesos
-compartidos con el `lm_head` y causal cross-entropy. Un smoke test pequeño verifica formas,
-causalidad, gradientes y que el modelo puede sobreajustar un batch dependiente del contexto.
+El modelo V1 ya incluye embeddings, bloques Pre-Norm con MHA o GQA + RoPE, RMSNorm, SwiGLU,
+pesos compartidos con el `lm_head` y causal cross-entropy. La generación incremental conserva
+una KV cache compacta por capa. Un smoke test pequeño verifica formas, causalidad, gradientes y
+que el modelo puede sobreajustar un batch dependiente del contexto.
 
 El módulo de entrenamiento añade grupos AdamW con weight decay selectivo, acumulación de
 gradientes ponderada por tokens, gradient clipping, warmup lineal con cosine decay o WSD,
@@ -160,6 +161,12 @@ uv run train-v1 \
   --wandb-name v1-smoke-001
 ```
 
+La atención usa MHA cuando se omite `--n-kv-heads`. Para activar GQA, indica un divisor de
+`--n-heads`; por ejemplo, `--n-heads 8 --n-kv-heads 2` hace que cada head K/V sea compartido por
+cuatro heads Q. El valor `1` selecciona MQA. Las muestras greedy y la generación del evaluation
+harness usan automáticamente la KV cache compacta y la reconstruyen cuando alcanzan el límite
+de contexto.
+
 Los prompts son fijos durante toda la ejecución para poder comparar checkpoints sin introducir
 azar de sampling. La evaluación frecuente usa como máximo `--eval-batches 20`, seleccionados
 de forma determinista y equidistante a lo largo de todo el split; no evalúa sólo su comienzo.
@@ -196,7 +203,8 @@ ya exista, en vez de crear silenciosamente uno nuevo. Antes de continuar tambié
 contrato de datos (manifest o receta), seed, batch size y los hiperparámetros de AdamW que
 determinan la posición de datos y la siguiente actualización. La
 evaluación periódica y las muestras realizadas al abrir el run preservan el RNG restaurado.
-Los checkpoints v6 guardan tanto su propia loss de validación como la mejor observada, de modo
+Los checkpoints v7 guardan tanto su propia loss de validación como la mejor observada, además
+de la configuración de heads K/V, de modo
 que una reanudación no puede reemplazar `best_validation.pt` por un modelo peor. Como el
 learning-rate schedule es una función del step y de la configuración guardada, no necesita un
 objeto de scheduler separado.
@@ -204,9 +212,10 @@ objeto de scheduler separado.
 En runs con receta, el checkpoint también conserva el presupuesto configurado y los tokens
 realmente consumidos por cada fuente; la trazabilidad de la mezcla no depende de W&B.
 
-Los checkpoints antiguos, incluido el formato v1, todavía se pueden abrir. Como v1 no guardaba el hash del
-manifest, el batch size ni la configuración exacta del optimizador, la carga avisa de que no
-puede verificar esos datos antes de continuar.
+Los checkpoints antiguos, incluido el formato v1, todavía se pueden abrir. Los formatos v1–v6
+no guardaban `n_kv_heads` y se interpretan como MHA, por lo que conservan las formas de sus
+pesos originales. Como v1 no guardaba el hash del manifest, el batch size ni la configuración
+exacta del optimizador, la carga avisa de que no puede verificar esos datos antes de continuar.
 
 Cada experimento debe usar un `--checkpoint-dir` exclusivo: la retención se aplica a todos los
 archivos `step_*.pt` de ese directorio y nunca a `best_validation.pt`. Esto evita mezclar

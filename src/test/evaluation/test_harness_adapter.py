@@ -8,9 +8,10 @@ import torch
 from evaluation.harness_adapter import GPT2HarnessAdapter
 from model.config import ModelConfig
 from model.gpt import GPT
+from test_support.cached_gpt import CachedGenerationGPT
 
 
-class ConstantTokenGPT(GPT):
+class ConstantTokenGPT(CachedGenerationGPT):
     """Predict one real token while assigning a larger padded-vocab logit."""
 
     def __init__(self, predicted_token: int, max_seq_len: int = 8) -> None:
@@ -188,3 +189,25 @@ def test_generate_until_never_exceeds_the_request_token_budget() -> None:
 
     assert results == [" hello"]
     assert model.generation_step == 1
+
+
+def test_generate_until_batches_requests_with_matching_cache_lengths() -> None:
+    encoding = tiktoken.get_encoding("gpt2")
+    hello_token = encoding.encode(" hello")
+    newline_token = encoding.encode("\n")
+    model = PlannedGenerationGPT((hello_token[0], newline_token[0]))
+    adapter = GPT2HarnessAdapter(
+        model=model,
+        encoding=encoding,
+        device="cpu",
+        batch_size=2,
+    )
+    requests = [
+        SimpleNamespace(args=(context, {"until": ["\n"], "max_gen_toks": 4}))
+        for context in ("a", "b")
+    ]
+
+    results = adapter.generate_until(requests)
+
+    assert results == [" hello", " hello"]
+    assert model.observed_batch_sizes == [2, 2]

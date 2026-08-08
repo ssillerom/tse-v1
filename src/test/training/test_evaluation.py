@@ -6,6 +6,7 @@ import torch
 
 from model.config import ModelConfig
 from model.gpt import GPT
+from test_support.cached_gpt import CachedGenerationGPT
 from training.evaluation import (
     EVALUATION_PROMPTS,
     EvaluationPrompt,
@@ -27,7 +28,7 @@ def test_validation_indices_cover_the_complete_split_deterministically() -> None
     assert evenly_spaced_validation_indices(dataset_size=3, sample_size=10) == (0, 1, 2)
 
 
-class ScriptedGPT(GPT):
+class ScriptedGPT(CachedGenerationGPT):
     """Return controlled next-token logits through the public GPT interface."""
 
     def __init__(
@@ -129,3 +130,37 @@ def test_prompt_samples_decode_only_the_generated_continuation() -> None:
     assert samples[0].category == "test"
     assert samples[0].prompt == "Hello"
     assert samples[0].continuation == " world"
+
+
+def test_cached_generation_matches_sliding_context_generation() -> None:
+    torch.manual_seed(42)
+    model = GPT(
+        ModelConfig(
+            vocab_size=16,
+            d_model=16,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=2,
+            max_seq_len=4,
+            dropout=0.0,
+        )
+    )
+    model.eval()
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    expected = input_ids
+    with torch.inference_mode():
+        for _ in range(6):
+            context = expected[:, -model.config.max_seq_len :]
+            logits, _ = model(context)
+            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            expected = torch.cat((expected, next_token), dim=1)
+
+    generated = generate_greedy(
+        model=model,
+        input_ids=input_ids,
+        max_new_tokens=6,
+        eot_token_id=15,
+        tokenizer_vocab_size=16,
+    )
+
+    torch.testing.assert_close(generated, expected)

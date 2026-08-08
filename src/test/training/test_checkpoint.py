@@ -436,6 +436,34 @@ def test_checkpoint_v1_without_precision_loads_as_fp32(tmp_path: Path) -> None:
     assert restored.step == 0
 
 
+def test_checkpoint_v6_without_key_value_heads_loads_as_multi_head_attention(
+    tmp_path: Path,
+) -> None:
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    training_config = TrainingConfig(max_steps=1)
+    checkpoint_path = save_checkpoint(
+        path=tmp_path / "step_000000.pt",
+        model=model,
+        optimizer=optimizer,
+        step=0,
+        training_config=training_config,
+    )
+    payload = torch.load(checkpoint_path, weights_only=True)
+    payload["format_version"] = 6
+    payload["model_config"].pop("n_kv_heads")
+    torch.save(payload, checkpoint_path)
+
+    restored = restore_checkpoint(
+        path=checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        training_config=training_config,
+    )
+
+    assert restored.step == 0
+
+
 def test_checkpoint_v1_without_run_config_loads_with_an_explicit_warning(
     tmp_path: Path,
 ) -> None:

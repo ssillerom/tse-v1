@@ -7,7 +7,7 @@ import torch
 import wandb
 
 from model.config import ModelConfig
-from model.gpt import GPT
+from test_support.cached_gpt import CachedGenerationGPT
 from training.evaluation import EvaluationPrompt
 from training.trainer import EvaluationMetrics, StepMetrics
 from training.wandb_logging import WandbEvaluationLogger, metrics_to_wandb
@@ -108,7 +108,7 @@ class FakeRun:
         return object()
 
 
-class ScriptedGPT(GPT):
+class ScriptedGPT(CachedGenerationGPT):
     def __init__(self, continuation_token: int, eot_token: int) -> None:
         super().__init__(
             ModelConfig(

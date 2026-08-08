@@ -1,4 +1,4 @@
-"""Multi-head causal self-attention: each token attends to its position and past.
+"""Causal self-attention with optional grouped query heads and incremental K/V state.
 
 The layer receives ``x`` with shape ``[batch, tokens, d_model]`` and creates
 three learned representations:
@@ -8,7 +8,8 @@ three learned representations:
 - Value (V): the information each token provides when it is attended to.
 
 Q, K, and V are split into heads so that several relationship spaces can be
-learned in parallel. RoPE rotates Q and K to inject position information.
+learned in parallel. With GQA, several query heads share each K/V head. RoPE
+rotates Q and K to inject position information.
 Attention can use PyTorch SDPA, which selects an efficient kernel when
 available, or the manual implementation retained for teaching. Both paths
 apply scaling, the causal mask, softmax, and dropout before combining values.
@@ -20,6 +21,7 @@ projections are not required to remain disjoint.
 """
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -28,9 +30,27 @@ import torch.nn.functional as F
 from src.model.rope import RoPECache, apply_rope
 
 
+@dataclass(frozen=True)
+class AttentionKVCache:
+    """Compact rotated keys and values retained for one attention layer."""
+
+    key: torch.Tensor
+    value: torch.Tensor
+
+    @property
+    def seq_len(self) -> int:
+        if self.key.ndim != 4 or self.value.ndim != 4:
+            raise ValueError(
+                "cache must have shape [batch_size, n_kv_heads, cached_tokens, head_dim]"
+            )
+        if self.key.shape != self.value.shape:
+            raise ValueError("cached keys and values must have the same shape")
+        return self.key.size(2)
+
+
 class MultiHeadAttention(nn.Module):
     """
-    Standard causal multi-head self-attention.
+    Causal self-attention supporting MHA, GQA, and MQA configurations.
 
     Input:
         x: [batch_size, seq_len, d_model]
@@ -46,6 +66,7 @@ class MultiHeadAttention(nn.Module):
         d_model: int,
         n_heads: int,
         max_seq_len: int,
+        n_kv_heads: int | None = None,
         dropout: float = 0.0,
         qkv_bias: bool = False,
         rope_theta: float = 10_000.0,
@@ -74,8 +95,19 @@ class MultiHeadAttention(nn.Module):
         if not isinstance(use_sdpa, bool):
             raise ValueError(f"use_sdpa must be a boolean, got {use_sdpa!r}")
 
+        if n_kv_heads is not None and (
+            not isinstance(n_kv_heads, int) or isinstance(n_kv_heads, bool) or n_kv_heads <= 0
+        ):
+            raise ValueError(f"n_kv_heads must be a positive integer or None, got {n_kv_heads!r}")
+
+        resolved_n_kv_heads = n_heads if n_kv_heads is None else n_kv_heads
+        if n_heads % resolved_n_kv_heads != 0:
+            raise ValueError(f"n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})")
+
         self.d_model = d_model
         self.n_heads = n_heads
+        self.n_kv_heads = resolved_n_kv_heads
+        self.n_repeat_kv = n_heads // self.n_kv_heads
         self.head_dim = d_model // n_heads
         self.max_seq_len = max_seq_len
         self.use_sdpa = use_sdpa
@@ -99,14 +131,14 @@ class MultiHeadAttention(nn.Module):
         # K describes how each token can be found.
         self.W_k = nn.Linear(
             in_features=d_model,
-            out_features=d_model,
+            out_features=self.n_kv_heads * self.head_dim,
             bias=qkv_bias,
         )
 
         # V contains the information each token provides.
         self.W_v = nn.Linear(
             in_features=d_model,
-            out_features=d_model,
+            out_features=self.n_kv_heads * self.head_dim,
             bias=qkv_bias,
         )
 
@@ -141,6 +173,27 @@ class MultiHeadAttention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output, _ = self._forward(x, cache=None, return_cache=False)
+        return output
+
+    def forward_with_cache(
+        self,
+        x: torch.Tensor,
+        cache: AttentionKVCache | None = None,
+    ) -> tuple[torch.Tensor, AttentionKVCache]:
+        """Attend to new tokens and return compact K/V state for later decoding."""
+        output, updated_cache = self._forward(x, cache=cache, return_cache=True)
+        if updated_cache is None:
+            raise RuntimeError("cached attention did not produce a cache")
+        return output, updated_cache
+
+    def _forward(
+        self,
+        x: torch.Tensor,
+        *,
+        cache: AttentionKVCache | None,
+        return_cache: bool,
+    ) -> tuple[torch.Tensor, AttentionKVCache | None]:
         if x.ndim != 3:
             raise ValueError("Expected x with shape [batch_size, seq_len, d_model]")
 
@@ -149,8 +202,12 @@ class MultiHeadAttention(nn.Module):
         if input_dim != self.d_model:
             raise ValueError(f"Expected input dimension {self.d_model}, got {input_dim}")
 
-        if seq_len > self.max_seq_len:
-            raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len={self.max_seq_len}")
+        cached_seq_len = self._validate_cache(cache, x)
+        total_seq_len = cached_seq_len + seq_len
+        if total_seq_len > self.max_seq_len:
+            raise ValueError(
+                f"Sequence length {total_seq_len} exceeds max_seq_len={self.max_seq_len}"
+            )
 
         # ---------------------------------------------------------
         # 1. Create queries, keys, and values
@@ -160,11 +217,14 @@ class MultiHeadAttention(nn.Module):
         k = self.W_k(x)
         v = self.W_v(x)
 
-        # Shape:
-        # [batch_size, seq_len, d_model]
+        if cache is not None and (cache.key.dtype != k.dtype or cache.value.dtype != v.dtype):
+            raise ValueError("cache and projected keys/values must have the same dtype")
+
+        # Q shape: [batch_size, seq_len, d_model]
+        # K/V shape: [batch_size, seq_len, n_kv_heads * head_dim]
 
         # ---------------------------------------------------------
-        # 2. Split d_model into multiple heads
+        # 2. Split projections into query heads and shared K/V heads
         # ---------------------------------------------------------
 
         q = q.view(
@@ -177,23 +237,24 @@ class MultiHeadAttention(nn.Module):
         k = k.view(
             batch_size,
             seq_len,
-            self.n_heads,
+            self.n_kv_heads,
             self.head_dim,
         )
 
         v = v.view(
             batch_size,
             seq_len,
-            self.n_heads,
+            self.n_kv_heads,
             self.head_dim,
         )
 
-        # Shape:
-        # [batch_size, seq_len, n_heads, head_dim]
+        # Q shape: [batch_size, seq_len, n_heads, head_dim]
+        # K/V shape: [batch_size, seq_len, n_kv_heads, head_dim]
 
         # RoPE rotates queries and keys before their dot product so attention
         # scores encode the relative distance between token positions.
-        freqs = self.rope_cache.get_freqs(seq_len)
+        all_freqs = self.rope_cache.get_freqs(total_seq_len)
+        freqs = tuple(freq[cached_seq_len:total_seq_len] for freq in all_freqs)
         q = apply_rope(q, freqs)
         k = apply_rope(k, freqs)
 
@@ -205,6 +266,16 @@ class MultiHeadAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        if cache is not None:
+            k = torch.cat((cache.key, k), dim=2)
+            v = torch.cat((cache.value, v), dim=2)
+
+        updated_cache = AttentionKVCache(key=k, value=v) if return_cache else None
+
+        if self.n_repeat_kv > 1:
+            k = k.repeat_interleave(self.n_repeat_kv, dim=1)
+            v = v.repeat_interleave(self.n_repeat_kv, dim=1)
+
         # Shape:
         # [batch_size, n_heads, seq_len, head_dim]
 
@@ -212,14 +283,24 @@ class MultiHeadAttention(nn.Module):
         # 4. Compute attention with SDPA or the manual path
         # ---------------------------------------------------------
 
+        allowed_attention_mask = None
+        if cached_seq_len > 0:
+            query_positions = torch.arange(
+                cached_seq_len,
+                total_seq_len,
+                device=x.device,
+            )
+            key_positions = torch.arange(total_seq_len, device=x.device)
+            allowed_attention_mask = query_positions.unsqueeze(1) >= key_positions.unsqueeze(0)
+
         if self.use_sdpa:
             context = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                attn_mask=None,
+                attn_mask=allowed_attention_mask,
                 dropout_p=self.attention_dropout.p if self.training else 0.0,
-                is_causal=True,
+                is_causal=cached_seq_len == 0,
             )
         else:
             attention_scores = q @ k.transpose(-2, -1)
@@ -227,7 +308,12 @@ class MultiHeadAttention(nn.Module):
 
             if self.causal_mask is None:
                 raise RuntimeError("Manual attention requires a causal mask")
-            mask = self.causal_mask[:seq_len, :seq_len]
+            if cached_seq_len == 0:
+                mask = self.causal_mask[:seq_len, :seq_len]
+            else:
+                if allowed_attention_mask is None:
+                    raise RuntimeError("cached attention requires a causal mask")
+                mask = ~allowed_attention_mask
             attention_scores = attention_scores.masked_fill(
                 mask,
                 -torch.inf,
@@ -267,4 +353,23 @@ class MultiHeadAttention(nn.Module):
 
         output: torch.Tensor = self.W_o(context)
 
-        return output
+        return output, updated_cache
+
+    def _validate_cache(
+        self,
+        cache: AttentionKVCache | None,
+        x: torch.Tensor,
+    ) -> int:
+        if cache is None:
+            return 0
+        cached_seq_len = cache.seq_len
+        expected_prefix = (x.size(0), self.n_kv_heads)
+        if cache.key.shape[:2] != expected_prefix:
+            raise ValueError(
+                "cache must have shape [batch_size, n_kv_heads, cached_tokens, head_dim]"
+            )
+        if cache.key.size(3) != self.head_dim:
+            raise ValueError(f"cache head dimension must be {self.head_dim}")
+        if cache.key.device != x.device or cache.value.device != x.device:
+            raise ValueError("cache and input must be on the same device")
+        return cached_seq_len

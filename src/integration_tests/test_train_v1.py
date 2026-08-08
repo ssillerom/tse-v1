@@ -124,6 +124,8 @@ def test_train_v1_runs_evaluation_generation_and_checkpointing_offline(
             "1",
             "--n-heads",
             "2",
+            "--n-kv-heads",
+            "1",
             "--seq-len",
             "4",
             "--batch-size",
@@ -151,6 +153,8 @@ def test_train_v1_runs_evaluation_generation_and_checkpointing_offline(
     checkpoint_path = checkpoint_dir / "step_000001.pt"
     assert checkpoint_path.is_file()
     checkpoint = torch.load(checkpoint_path, weights_only=True)
+    assert checkpoint["model_config"]["n_kv_heads"] == 1
+    assert checkpoint["model_state"]["blocks.0.attention.W_k.weight"].shape == (4, 8)
     assert checkpoint["training_config"]["precision"] == "bf16"
     best_checkpoint = torch.load(checkpoint_dir / "best_validation.pt", weights_only=True)
     assert best_checkpoint["validation_loss"] == pytest.approx(
