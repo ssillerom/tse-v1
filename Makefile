@@ -56,6 +56,7 @@ MODEL_ARGS := \
 	--d-model 1024 \
 	--n-layers 24 \
 	--n-heads 16 \
+	--n-kv-heads 4 \
 	--seq-len $(SEQ_LEN) \
 	$(TORCH_COMPILE_ARGS)
 
