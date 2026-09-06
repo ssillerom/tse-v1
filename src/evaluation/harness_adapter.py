@@ -1,7 +1,6 @@
 """Thin lm-evaluation-harness adapter for the repository's raw PyTorch GPT."""
 
 from collections.abc import Sequence
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
@@ -12,7 +11,8 @@ import torch
 
 from src.model.config import ModelConfig
 from src.model.gpt import GPT, GPTKVCache
-from src.training.checkpoint import SUPPORTED_CHECKPOINT_FORMAT_VERSIONS
+from src.runtime import precision_context, validate_precision
+from src.training.checkpoint import read_checkpoint_payload
 
 try:
     from lm_eval.api.model import LM as _HarnessLM
@@ -51,25 +51,10 @@ def load_evaluation_checkpoint(
 ) -> EvaluationCheckpoint:
     """Load model weights and architecture without requiring training arguments."""
     checkpoint_path = Path(path)
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
-    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    if not isinstance(payload, dict):
-        raise ValueError("checkpoint payload must be a dictionary")
-    format_version = payload.get("format_version")
-    if not isinstance(format_version, int) or isinstance(format_version, bool):
-        raise ValueError("checkpoint format_version must be an integer")
-    if format_version not in SUPPORTED_CHECKPOINT_FORMAT_VERSIONS:
-        raise ValueError(f"Unsupported checkpoint format_version: {format_version!r}")
-    model_config_payload = payload.get("model_config")
-    model_state = payload.get("model_state")
-    step = payload.get("step")
-    if not isinstance(model_config_payload, dict):
-        raise ValueError("checkpoint contains an invalid model_config")
-    if not isinstance(model_state, dict):
-        raise ValueError("checkpoint contains an invalid model_state")
-    if not isinstance(step, int) or isinstance(step, bool) or step < 0:
-        raise ValueError("checkpoint contains an invalid step")
+    payload = read_checkpoint_payload(checkpoint_path)
+    model_config_payload = payload["model_config"]
+    model_state = payload["model_state"]
+    step = payload["step"]
 
     try:
         model_config = ModelConfig(**model_config_payload)
@@ -117,17 +102,7 @@ class GPT2HarnessAdapter(_HarnessLM):  # type: ignore[misc]
         super().__init__()
         if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
-        if precision not in ("fp32", "bf16"):
-            raise ValueError("precision must be one of ('fp32', 'bf16')")
-        resolved_device = torch.device(device)
-        if precision == "bf16" and resolved_device.type not in ("cpu", "cuda"):
-            raise ValueError("bf16 evaluation is supported only on CPU or CUDA")
-        if (
-            precision == "bf16"
-            and resolved_device.type == "cuda"
-            and not torch.cuda.is_bf16_supported()
-        ):
-            raise ValueError("bf16 is not supported by the requested CUDA device")
+        resolved_device = validate_precision(device, precision)
         if model.config.vocab_size < encoding.n_vocab:
             raise ValueError(
                 "model vocabulary is smaller than the tokenizer vocabulary: "
@@ -254,17 +229,21 @@ class GPT2HarnessAdapter(_HarnessLM):  # type: ignore[misc]
         self.model.eval()
         try:
             with torch.inference_mode():
-                while True:
-                    active = [
-                        index
-                        for index, state in enumerate(states)
-                        if state.result is None and len(state.generated_ids) < state.max_new_tokens
-                    ]
-                    if not active:
-                        break
-                    for offset in range(0, len(active), self.batch_size):
-                        batch_indices = active[offset : offset + self.batch_size]
+                for offset in range(0, len(states), self.batch_size):
+                    batch_indices = list(range(offset, min(offset + self.batch_size, len(states))))
+                    while batch_indices:
                         self._generate_one_token(states, batch_indices)
+                        active = []
+                        for index in batch_indices:
+                            state = states[index]
+                            if (
+                                state.result is None
+                                and len(state.generated_ids) < state.max_new_tokens
+                            ):
+                                active.append(index)
+                            else:
+                                state.cache = None
+                        batch_indices = active
         finally:
             self.model.train(was_training)
 
@@ -350,7 +329,7 @@ class GPT2HarnessAdapter(_HarnessLM):  # type: ignore[misc]
                 if group_caches[0] is None
                 else GPTKVCache.batch(cast(list[GPTKVCache], group_caches))
             )
-            with self._precision_context():
+            with precision_context(self._device, self.precision):
                 logits, updated_cache = self.model.forward_with_cache(input_ids, batched_cache)
             split_caches = updated_cache.unbind()
             next_ids = torch.argmax(logits[:, -1, : self.encoding.n_vocab], dim=-1).tolist()
@@ -400,7 +379,7 @@ class GPT2HarnessAdapter(_HarnessLM):  # type: ignore[misc]
                             dtype=torch.long,
                             device=self._device,
                         )
-                    with self._precision_context():
+                    with precision_context(self._device, self.precision):
                         logits, _ = self.model(input_ids)
                     real_logits = logits[..., : self.encoding.n_vocab].float()
                     log_probabilities = torch.log_softmax(real_logits, dim=-1)
@@ -428,8 +407,3 @@ class GPT2HarnessAdapter(_HarnessLM):  # type: ignore[misc]
         finally:
             self.model.train(was_training)
         return results
-
-    def _precision_context(self) -> AbstractContextManager[None]:
-        if self.precision == "fp32":
-            return nullcontext()
-        return torch.autocast(device_type=self._device.type, dtype=torch.bfloat16)

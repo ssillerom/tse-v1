@@ -3,21 +3,22 @@
 import math
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from itertools import islice
 from numbers import Real
 from typing import Literal
 
 import torch
 
 from src.model.gpt import GPT, IGNORE_INDEX
+from src.runtime import Precision as Precision
+from src.runtime import precision_context, validate_precision
 
 from .evaluation import perplexity_from_loss
 from .rng import capture_torch_rng_state, restore_torch_rng_state
 from .scheduler import get_learning_rate, get_wsd_learning_rate
 
 Batch = tuple[torch.Tensor, torch.Tensor]
-Precision = Literal["fp32", "bf16"]
 LearningRateSchedule = Literal["cosine", "wsd"]
 
 
@@ -29,36 +30,6 @@ def _validate_max_grad_norm(max_grad_norm: object) -> None:
         or max_grad_norm <= 0
     ):
         raise ValueError(f"max_grad_norm must be finite and positive, got {max_grad_norm!r}")
-
-
-def _validate_precision_device(
-    device: torch.device | str,
-    precision: Precision,
-) -> torch.device:
-    resolved_device = torch.device(device)
-    if precision not in ("fp32", "bf16"):
-        raise ValueError(f"precision must be one of ('fp32', 'bf16'), got {precision!r}")
-    if precision == "bf16" and resolved_device.type not in ("cpu", "cuda"):
-        raise ValueError(
-            f"bf16 precision is supported only on CPU or CUDA, got device {resolved_device.type!r}"
-        )
-    if (
-        precision == "bf16"
-        and resolved_device.type == "cuda"
-        and not torch.cuda.is_bf16_supported()
-    ):
-        raise ValueError("bf16 precision is not supported by the requested CUDA device")
-    return resolved_device
-
-
-def _forward_precision_context(
-    device: torch.device | str,
-    precision: Precision,
-) -> AbstractContextManager[None]:
-    resolved_device = _validate_precision_device(device, precision)
-    if precision == "fp32":
-        return nullcontext()
-    return torch.autocast(device_type=resolved_device.type, dtype=torch.bfloat16)
 
 
 @dataclass(frozen=True)
@@ -105,33 +76,37 @@ class TrainingConfig:
             raise ValueError("eval_batches requires eval_interval")
         if self.precision not in ("fp32", "bf16"):
             raise ValueError(f"precision must be one of ('fp32', 'bf16'), got {self.precision!r}")
+        # Validate schedule-specific fields and the shared numeric boundaries.
+        self.learning_rate_at(0)
+
+    def learning_rate_at(self, step: int) -> float:
+        """Return this run's scheduled rate for a zero-based optimizer step."""
         if self.learning_rate_schedule == "cosine":
             if self.decay_start_step is not None:
                 raise ValueError("decay_start_step is supported only by the wsd schedule")
-            get_learning_rate(
-                step=0,
+            return get_learning_rate(
+                step=step,
                 warmup_steps=self.warmup_steps,
                 max_steps=self.max_steps,
                 max_learning_rate=self.max_learning_rate,
                 min_learning_rate=self.min_learning_rate,
             )
-        elif self.learning_rate_schedule == "wsd":
+        if self.learning_rate_schedule == "wsd":
             if self.decay_start_step is None:
                 raise ValueError("decay_start_step is required for the wsd schedule")
             if self.min_learning_rate != 0.0:
                 raise ValueError("min_learning_rate must be 0.0 for the wsd schedule")
-            get_wsd_learning_rate(
-                step=0,
+            return get_wsd_learning_rate(
+                step=step,
                 warmup_steps=self.warmup_steps,
                 decay_start_step=self.decay_start_step,
                 max_steps=self.max_steps,
                 max_learning_rate=self.max_learning_rate,
             )
-        else:
-            raise ValueError(
-                "learning_rate_schedule must be one of ('cosine', 'wsd'), "
-                f"got {self.learning_rate_schedule!r}"
-            )
+        raise ValueError(
+            "learning_rate_schedule must be one of ('cosine', 'wsd'), "
+            f"got {self.learning_rate_schedule!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -205,7 +180,7 @@ def evaluate_metrics(
     precision: Precision = "fp32",
 ) -> EvaluationMetrics:
     """Return token-weighted metrics without changing the caller's model mode."""
-    _validate_precision_device(device, precision)
+    validate_precision(device, precision)
     if max_batches is not None and (
         not isinstance(max_batches, int) or isinstance(max_batches, bool) or max_batches <= 0
     ):
@@ -219,16 +194,13 @@ def evaluate_metrics(
 
     try:
         with torch.no_grad():
-            for batch_index, (input_ids, targets) in enumerate(batches):
-                if max_batches is not None and batch_index >= max_batches:
-                    break
-
+            for input_ids, targets in islice(batches, max_batches):
                 target_count = int((targets != IGNORE_INDEX).sum().item())
                 if target_count == 0:
                     continue
                 input_ids = input_ids.to(device)
                 targets = targets.to(device)
-                with _forward_precision_context(device, precision):
+                with precision_context(device, precision):
                     _, loss = model(input_ids, targets)
                 if loss is None:
                     raise RuntimeError("model did not return a loss for an evaluation batch")
@@ -449,24 +421,7 @@ def train(
             batch, batch_iterator = _next_batch(train_batches, batch_iterator)
             microbatches.append(batch)
 
-        if config.learning_rate_schedule == "wsd":
-            if config.decay_start_step is None:
-                raise RuntimeError("validated WSD config has no decay_start_step")
-            learning_rate = get_wsd_learning_rate(
-                step=step_index,
-                warmup_steps=config.warmup_steps,
-                decay_start_step=config.decay_start_step,
-                max_steps=config.max_steps,
-                max_learning_rate=config.max_learning_rate,
-            )
-        else:
-            learning_rate = get_learning_rate(
-                step=step_index,
-                warmup_steps=config.warmup_steps,
-                max_steps=config.max_steps,
-                max_learning_rate=config.max_learning_rate,
-                min_learning_rate=config.min_learning_rate,
-            )
+        learning_rate = config.learning_rate_at(step_index)
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = learning_rate
 
@@ -551,7 +506,7 @@ def train_step(
     precision: Precision = "fp32",
 ) -> tuple[float, float]:
     """Run one optimizer update over one or more accumulated microbatches."""
-    _validate_precision_device(device, precision)
+    validate_precision(device, precision)
     if not microbatches:
         raise ValueError("microbatches must contain at least one batch")
     _validate_max_grad_norm(max_grad_norm)
@@ -573,7 +528,7 @@ def train_step(
             continue
         input_ids = input_ids.to(device)
         targets = targets.to(device)
-        with _forward_precision_context(device, precision):
+        with precision_context(device, precision):
             _, loss = model(input_ids, targets)
         if loss is None:
             raise RuntimeError("model did not return a loss for a training batch")

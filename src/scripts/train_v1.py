@@ -18,10 +18,11 @@ import tiktoken
 import torch
 import wandb
 
-from src.data.manifest import ManifestTokenizer, load_manifest
+from src.data.manifest import DataManifest, ManifestTokenizer, load_manifest
 from src.data.recipe import TrainingRecipe, load_training_recipe
 from src.model.config import ModelConfig
 from src.model.gpt import GPT
+from src.runtime import PrecisionArgument, resolve_device, resolve_precision
 from src.training.checkpoint import (
     RestoredCheckpoint,
     TrainingRunConfig,
@@ -48,7 +49,6 @@ from src.training.wandb_logging import (
 )
 
 WandbMode = Literal["online", "offline", "disabled"]
-PrecisionArgument = Literal["auto", "fp32", "bf16"]
 ADAMW_BETAS = (0.9, 0.95)
 ADAMW_EPS = 1e-8
 DEFAULT_WANDB_PROJECT = "llm-from-scratch"
@@ -148,30 +148,6 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_device(requested: str) -> torch.device:
-    if requested == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA was requested but is not available")
-    if requested == "mps" and not torch.backends.mps.is_available():
-        raise ValueError("MPS was requested but is not available")
-    return torch.device(requested)
-
-
-def _resolve_precision(requested: PrecisionArgument, device: torch.device) -> Precision:
-    if requested == "auto":
-        return "bf16" if device.type == "cuda" and torch.cuda.is_bf16_supported() else "fp32"
-    if requested == "bf16" and device.type == "mps":
-        raise ValueError("bf16 precision is not supported by this trainer on MPS")
-    if requested == "bf16" and device.type == "cuda" and not torch.cuda.is_bf16_supported():
-        raise ValueError("bf16 precision was requested but is not supported by this CUDA device")
-    return requested
-
-
 def _load_encoding_from_tokenizer(tokenizer: ManifestTokenizer) -> tiktoken.Encoding:
     encoding = tiktoken.get_encoding(tokenizer.encoding_name)
     if encoding.eot_token != tokenizer.eot_token_id:
@@ -182,8 +158,8 @@ def _load_encoding_from_tokenizer(tokenizer: ManifestTokenizer) -> tiktoken.Enco
     return encoding
 
 
-def _load_encoding(manifest_path: Path) -> tiktoken.Encoding:
-    tokenizer = load_manifest(manifest_path).tokenizer
+def _load_encoding(manifest: DataManifest) -> tiktoken.Encoding:
+    tokenizer = manifest.tokenizer
     if tokenizer is None:
         raise ValueError("Manifest must declare tokenizer metadata for evaluation")
     return _load_encoding_from_tokenizer(tokenizer)
@@ -463,8 +439,8 @@ def main(argv: list[str] | None = None) -> int:
     arguments = _build_parser().parse_args(argv)
     _validate_cli_arguments(arguments)
 
-    device = _resolve_device(arguments.device)
-    precision = _resolve_precision(cast(PrecisionArgument, arguments.precision), device)
+    device = resolve_device(arguments.device)
+    precision = resolve_precision(cast(PrecisionArgument, arguments.precision), device)
     compile_mode = _resolve_compile_mode(arguments, device)
     torch.manual_seed(arguments.seed)
     if device.type == "mps":
@@ -472,12 +448,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # A recipe is a multi-source data contract; a manifest is the single-source
     # form. Both paths resolve to one tokenizer and one finite schedule.
-    recipe = None if arguments.recipe is None else load_training_recipe(arguments.recipe)
-    encoding = (
-        _load_encoding(arguments.manifest)
-        if recipe is None
-        else _load_encoding_from_tokenizer(recipe.tokenizer)
-    )
+    recipe = None
+    manifest = None
+    if arguments.recipe is None:
+        manifest = load_manifest(arguments.manifest)
+        encoding = _load_encoding(manifest)
+    else:
+        recipe = load_training_recipe(arguments.recipe)
+        encoding = _load_encoding_from_tokenizer(recipe.tokenizer)
     if arguments.vocab_size < encoding.n_vocab:
         raise ValueError(
             f"vocab_size={arguments.vocab_size} is smaller than tokenizer vocabulary "
@@ -500,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
     # Validation subsets are frozen and evenly spaced across each held-out
     # split, so every checkpoint sees the same evidence at bounded cost.
     dataset_bundle = build_dataset_bundle(
-        manifest_path=arguments.manifest,
+        manifest_path=manifest,
         recipe=recipe,
         seq_len=model_config.max_seq_len,
         batch_size=arguments.batch_size,
@@ -533,6 +511,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     training_model = model
     start_step = 0 if restored_checkpoint is None else restored_checkpoint.step
+    restored_tokens_seen = 0 if restored_checkpoint is None else restored_checkpoint.tokens_seen
     training_inputs = build_training_inputs(
         bundle=dataset_bundle,
         recipe=recipe,
@@ -684,7 +663,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         checkpoint_writer.save_best_if_improved(
             step=start_step,
-            tokens_seen=training_inputs.tokens_seen_at_start,
+            tokens_seen=restored_tokens_seen,
             source_tokens_seen=training_inputs.source_tokens_seen,
             validation_loss=initial_validation_loss,
         )
@@ -720,11 +699,7 @@ def main(argv: list[str] | None = None) -> int:
             final_metrics = history[-1] if history else None
             checkpoint_writer.save_step(
                 step=final_step,
-                tokens_seen=(
-                    final_metrics.tokens_seen
-                    if final_metrics
-                    else training_inputs.tokens_seen_at_start
-                ),
+                tokens_seen=(final_metrics.tokens_seen if final_metrics else restored_tokens_seen),
                 source_tokens_seen=observer.source_tokens_seen,
                 validation_loss=(
                     final_metrics.validation_loss if final_metrics else initial_validation_loss

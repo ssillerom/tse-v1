@@ -1,6 +1,6 @@
 """Weights & Biases logging for V1 training and evaluation."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -16,7 +16,7 @@ from .evaluation import (
     EvaluationPrompt,
     generate_prompt_samples,
 )
-from .trainer import DomainEvaluation, StepMetrics
+from .trainer import DomainEvaluation, EvaluationMetrics, StepMetrics
 
 
 class WandbRun(Protocol):
@@ -46,10 +46,16 @@ def domain_evaluation_to_wandb(
         "validation/loss": evaluation.loss,
         "validation/perplexity": evaluation.perplexity,
     }
-    for domain, domain_metrics in evaluation.domains.items():
-        payload[f"validation/{domain}/loss"] = domain_metrics.loss
-        payload[f"validation/{domain}/perplexity"] = domain_metrics.perplexity
-        payload[f"validation/{domain}/target_tokens"] = domain_metrics.target_tokens
+    payload.update(_domain_metrics_to_wandb(evaluation.domains))
+    return payload
+
+
+def _domain_metrics_to_wandb(domains: Mapping[str, EvaluationMetrics]) -> dict[str, float | int]:
+    payload: dict[str, float | int] = {}
+    for domain, metrics in domains.items():
+        payload[f"validation/{domain}/loss"] = metrics.loss
+        payload[f"validation/{domain}/perplexity"] = metrics.perplexity
+        payload[f"validation/{domain}/target_tokens"] = metrics.target_tokens
     return payload
 
 
@@ -71,20 +77,7 @@ def metrics_to_wandb(metrics: StepMetrics) -> dict[str, float | int]:
         payload["validation/loss"] = metrics.validation_loss
         payload["validation/perplexity"] = metrics.validation_perplexity
         if metrics.validation_domains is not None:
-            payload.update(
-                domain_evaluation_to_wandb(
-                    DomainEvaluation(
-                        loss=metrics.validation_loss,
-                        perplexity=metrics.validation_perplexity,
-                        target_tokens=sum(
-                            domain_metrics.target_tokens
-                            for domain_metrics in metrics.validation_domains.values()
-                        ),
-                        domains=metrics.validation_domains,
-                    ),
-                    metrics.step,
-                )
-            )
+            payload.update(_domain_metrics_to_wandb(metrics.validation_domains))
     if metrics.source_tokens_seen is not None:
         for source, token_count in metrics.source_tokens_seen.items():
             payload[f"trainer/source_tokens_seen/{source}"] = token_count

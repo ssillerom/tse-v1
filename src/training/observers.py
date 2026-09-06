@@ -8,7 +8,6 @@ import torch
 
 from src.data.mixture import DeterministicMixtureSampler
 from src.model.gpt import GPT
-
 from src.training.checkpoint import TrainingRunConfig, save_checkpoint
 from src.training.trainer import StepMetrics, TrainingConfig
 from src.training.wandb_logging import WandbEvaluationLogger

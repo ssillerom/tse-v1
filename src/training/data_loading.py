@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from src.data.dataset import PretrainingDataset
+from src.data.manifest import DataManifest, load_manifest
 from src.data.mixture import DeterministicMixtureSampler, MixtureDataset
 from src.data.recipe import TrainingRecipe
 
@@ -39,7 +40,7 @@ class TrainingInputs:
 
 
 def build_validation_loader(
-    manifest_path: Path,
+    manifest_path: Path | DataManifest,
     *,
     seq_len: int,
     batch_size: int,
@@ -73,7 +74,7 @@ def build_validation_loader(
 
 def build_dataset_bundle(
     *,
-    manifest_path: Path | None,
+    manifest_path: Path | DataManifest | None,
     recipe: TrainingRecipe | None,
     seq_len: int,
     batch_size: int,
@@ -85,14 +86,19 @@ def build_dataset_bundle(
     if recipe is None:
         if manifest_path is None:
             raise RuntimeError("a manifest path is required without a recipe")
+        manifest = (
+            manifest_path
+            if isinstance(manifest_path, DataManifest)
+            else load_manifest(manifest_path)
+        )
         return DatasetBundle(
             train_dataset=PretrainingDataset(
-                manifest_path=manifest_path,
+                manifest_path=manifest,
                 split="train",
                 seq_len=seq_len,
             ),
             validation_batches=build_validation_loader(
-                manifest_path,
+                manifest,
                 seq_len=seq_len,
                 batch_size=batch_size,
                 eval_batches=eval_batches,
@@ -106,7 +112,7 @@ def build_dataset_bundle(
         train_dataset=MixtureDataset(
             {
                 source.name: PretrainingDataset(
-                    manifest_path=source.manifest_path,
+                    manifest_path=source.manifest,
                     split="train",
                     seq_len=seq_len,
                 )
@@ -115,7 +121,7 @@ def build_dataset_bundle(
         ),
         validation_batches={
             source.name: build_validation_loader(
-                source.manifest_path,
+                source.manifest,
                 seq_len=seq_len,
                 batch_size=batch_size,
                 eval_batches=eval_batches,

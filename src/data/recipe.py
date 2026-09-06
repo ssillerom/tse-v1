@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 
-from src.data.manifest import ManifestTokenizer, load_manifest
+from src.data.manifest import DataManifest, ManifestTokenizer, load_manifest
 
 RECIPE_FORMAT_VERSION = 1
 
@@ -16,6 +16,11 @@ class RecipeSource:
 
     name: str
     manifest_path: Path
+
+    @cached_property
+    def manifest(self) -> DataManifest:
+        """Keep one validated manifest for this recipe's setup lifetime."""
+        return load_manifest(self.manifest_path)
 
 
 @dataclass(frozen=True)
@@ -179,7 +184,7 @@ def load_training_recipe(path: str | Path) -> TrainingRecipe:
 
     tokenizer: ManifestTokenizer | None = None
     for source in sources:
-        source_tokenizer = load_manifest(source.manifest_path).tokenizer
+        source_tokenizer = source.manifest.tokenizer
         if source_tokenizer is None:
             raise ValueError(f"Source {source.name!r} manifest must declare a tokenizer")
         if tokenizer is None:

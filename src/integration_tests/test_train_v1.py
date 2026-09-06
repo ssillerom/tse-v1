@@ -102,6 +102,107 @@ def _write_recipe(directory: Path) -> Path:
     return recipe_path
 
 
+def test_completed_resume_preserves_checkpoint_counters(tmp_path: Path) -> None:
+    manifest = _write_training_manifest(tmp_path)
+    checkpoint_dir = tmp_path / "checkpoints"
+    arguments = [
+        "--manifest",
+        str(manifest),
+        "--checkpoint-dir",
+        str(checkpoint_dir),
+        "--device",
+        "cpu",
+        "--d-model",
+        "8",
+        "--n-layers",
+        "1",
+        "--n-heads",
+        "2",
+        "--seq-len",
+        "4",
+        "--batch-size",
+        "2",
+        "--grad-accum-steps",
+        "1",
+        "--max-steps",
+        "1",
+        "--warmup-steps",
+        "0",
+        "--eval-batches",
+        "1",
+        "--max-new-tokens",
+        "1",
+        "--checkpoint-interval",
+        "2",
+        "--wandb-mode",
+        "disabled",
+    ]
+    assert main(arguments) == 0
+    path = checkpoint_dir / "step_000001.pt"
+    before = torch.load(path, weights_only=True)
+    assert main(arguments + ["--resume", "latest"]) == 0
+    after = torch.load(path, weights_only=True)
+    assert after["tokens_seen"] == before["tokens_seen"] == 8
+    assert after["data_position"] == before["data_position"] == 2
+    assert after["step"] == before["step"] == 1
+    for name, weights in before["model_state"].items():
+        assert torch.equal(after["model_state"][name], weights)
+
+
+@pytest.mark.parametrize("use_recipe", [False, True])
+def test_training_setup_checks_each_shard_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_recipe: bool
+) -> None:
+    source = _write_recipe(tmp_path) if use_recipe else _write_training_manifest(tmp_path)
+    checked_shards = []
+    original_digest = hashlib.file_digest
+
+    def tracked_digest(file, digest, **kwargs):
+        if str(file.name).endswith(".bin"):
+            checked_shards.append(Path(file.name))
+        return original_digest(file, digest, **kwargs)
+
+    monkeypatch.setattr(hashlib, "file_digest", tracked_digest)
+    assert (
+        main(
+            [
+                "--recipe" if use_recipe else "--manifest",
+                str(source),
+                "--checkpoint-dir",
+                str(tmp_path / "checkpoints"),
+                "--device",
+                "cpu",
+                "--d-model",
+                "8",
+                "--n-layers",
+                "1",
+                "--n-heads",
+                "2",
+                "--seq-len",
+                "4",
+                "--batch-size",
+                "2",
+                "--grad-accum-steps",
+                "1",
+                "--max-steps",
+                "1",
+                "--warmup-steps",
+                "0",
+                "--eval-batches",
+                "1",
+                "--max-new-tokens",
+                "1",
+                "--wandb-mode",
+                "disabled",
+            ]
+        )
+        == 0
+    )
+    expected = set(tmp_path.rglob("*.bin"))
+    assert set(checked_shards) == expected
+    assert len(checked_shards) == len(expected)
+
+
 def test_train_v1_runs_evaluation_generation_and_checkpointing_offline(
     tmp_path: Path,
 ) -> None:

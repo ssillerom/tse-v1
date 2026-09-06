@@ -1,4 +1,5 @@
 import math
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -8,7 +9,31 @@ import torch
 from evaluation.harness_adapter import GPT2HarnessAdapter
 from model.config import ModelConfig
 from model.gpt import GPT
+from src.model.gpt import GPTKVCache
 from test_support.cached_gpt import CachedGenerationGPT
+
+
+def test_generation_bounds_live_caches_by_batch_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    caches = []
+    peak_live_rows = 0
+    original_unbind = GPTKVCache.unbind
+
+    def tracked_unbind(cache):
+        nonlocal peak_live_rows
+        rows = original_unbind(cache)
+        caches.extend(weakref.ref(row) for row in rows)
+        peak_live_rows = max(peak_live_rows, sum(ref() is not None for ref in caches))
+        return rows
+
+    monkeypatch.setattr(GPTKVCache, "unbind", tracked_unbind)
+    model = ConstantTokenGPT(predicted_token=100)
+    encoding = tiktoken.get_encoding("gpt2")
+    adapter = GPT2HarnessAdapter(model, encoding, "cpu", batch_size=2)
+    requests = [SimpleNamespace(args=("hello", {"max_gen_toks": 2})) for _ in range(12)]
+    results = adapter.generate_until(requests)
+    assert results == [encoding.decode([100, 100])] * 12
+    # During an update both the previous and replacement cache can be alive.
+    assert peak_live_rows <= 2 * adapter.batch_size
 
 
 class ConstantTokenGPT(CachedGenerationGPT):

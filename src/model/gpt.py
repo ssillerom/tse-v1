@@ -110,21 +110,25 @@ class GPT(nn.Module):
         if isinstance(module, nn.Linear) and module.bias is not None:
             nn.init.zeros_(module.bias)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        targets: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def _validate_input_ids(self, input_ids: torch.Tensor, cached_seq_len: int = 0) -> None:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, seq_len]")
         if input_ids.dtype != torch.long:
             raise ValueError("input_ids must have dtype torch.long")
         if input_ids.size(0) == 0 or input_ids.size(1) == 0:
             raise ValueError("batch and sequence dimensions must be non-empty")
-        if input_ids.size(1) > self.config.max_seq_len:
+        total_seq_len = cached_seq_len + input_ids.size(1)
+        if total_seq_len > self.config.max_seq_len:
             raise ValueError(
-                f"Sequence length {input_ids.size(1)} exceeds max_seq_len={self.config.max_seq_len}"
+                f"Sequence length {total_seq_len} exceeds max_seq_len={self.config.max_seq_len}"
             )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        self._validate_input_ids(input_ids)
         if targets is not None and targets.shape != input_ids.shape:
             raise ValueError("targets must have the same shape as input_ids")
         if targets is not None and targets.dtype != torch.long:
@@ -149,22 +153,12 @@ class GPT(nn.Module):
         cache: GPTKVCache | None = None,
     ) -> tuple[torch.Tensor, GPTKVCache]:
         """Return logits for new tokens and reusable per-layer K/V state."""
-        if input_ids.ndim != 2:
-            raise ValueError("input_ids must have shape [batch, seq_len]")
-        if input_ids.dtype != torch.long:
-            raise ValueError("input_ids must have dtype torch.long")
-        if input_ids.size(0) == 0 or input_ids.size(1) == 0:
-            raise ValueError("batch and sequence dimensions must be non-empty")
         if cache is not None and len(cache.layers) != self.config.n_layers:
             raise ValueError(
                 f"cache must contain {self.config.n_layers} layers, got {len(cache.layers)}"
             )
         cached_seq_len = 0 if cache is None else cache.seq_len
-        total_seq_len = cached_seq_len + input_ids.size(1)
-        if total_seq_len > self.config.max_seq_len:
-            raise ValueError(
-                f"Sequence length {total_seq_len} exceeds max_seq_len={self.config.max_seq_len}"
-            )
+        self._validate_input_ids(input_ids, cached_seq_len)
 
         x = self.embedding_dropout(self.token_embedding(input_ids))
         updated_layers: list[AttentionKVCache] = []

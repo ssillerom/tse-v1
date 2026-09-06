@@ -1,5 +1,6 @@
 import hashlib
 import json
+import pickle
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -90,6 +91,36 @@ def test_dataset_batches_sequences_with_a_dataloader(tmp_path: Path) -> None:
     assert targets.shape == (2, 3)
     assert input_ids.tolist() == [[0, 1, 2], [3, 4, 5]]
     assert targets.tolist() == [[1, 2, 3], [4, 5, 6]]
+
+
+def test_dataset_serialization_keeps_shards_file_backed(tmp_path: Path) -> None:
+    manifest_path = _write_prepared_dataset(
+        tmp_path, [("shard_0000.bin", "train", [1, 2, 3, 4] * 25_000)]
+    )
+    dataset = PretrainingDataset(manifest_path, split="train", seq_len=3)
+    dataset[0]  # Serialization must remain small even after a shard has been opened.
+    serialized = pickle.dumps(dataset)
+    assert len(serialized) < 10_000
+    restored = pickle.loads(serialized)
+    assert torch.equal(restored[0][0], dataset[0][0])
+    assert torch.equal(restored[len(restored) - 1][1], dataset[len(dataset) - 1][1])
+    assert restored.shards[0].tokens.filename == (tmp_path / "shard_0000.bin").resolve()
+
+
+def test_dataset_supports_spawn_workers(tmp_path: Path) -> None:
+    manifest_path = _write_prepared_dataset(
+        tmp_path, [("shard_0000.bin", "train", list(range(13)))]
+    )
+    dataset = PretrainingDataset(manifest_path, split="train", seq_len=3)
+    batches = list(
+        DataLoader(dataset, batch_size=2, num_workers=1, multiprocessing_context="spawn")
+    )
+    assert torch.cat([batch[0] for batch in batches]).tolist() == [
+        [0, 1, 2],
+        [3, 4, 5],
+        [6, 7, 8],
+        [9, 10, 11],
+    ]
 
 
 @pytest.mark.parametrize("seq_len", [0, -1, True])

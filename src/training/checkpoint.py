@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from numbers import Real
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import torch
 
@@ -260,15 +260,11 @@ def _checkpoint_paths(directory: Path) -> list[Path]:
     return [path for _, path in sorted(checkpoints)]
 
 
-def restore_checkpoint(
+def read_checkpoint_payload(
     path: str | Path,
-    model: GPT,
-    optimizer: torch.optim.Optimizer,
-    training_config: TrainingConfig,
     map_location: torch.device | str = "cpu",
-    run_config: TrainingRunConfig | None = None,
-) -> RestoredCheckpoint:
-    """Restore model, optimizer, random state, and run identity."""
+) -> dict[str, Any]:
+    """Read the common checkpoint envelope and normalize its model configuration."""
     checkpoint_path = Path(path)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
@@ -296,15 +292,90 @@ def restore_checkpoint(
             f"does not match payload step {step}"
         )
 
+    for field in ("model_state", "model_config"):
+        if not isinstance(payload.get(field), dict):
+            raise ValueError(f"checkpoint contains an invalid {field}")
+    model_config = dict(payload["model_config"])
+    if format_version <= 6:
+        model_config.setdefault("n_kv_heads", None)
+    return {**payload, "model_config": model_config}
+
+
+def _normalize_training_configs(
+    payload: Mapping[str, Any],
+    expected_run_config: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Migrate legacy training fields before comparing the current run contract."""
+    format_version = payload["format_version"]
+    training_config = payload.get("training_config")
+    run_config = payload.get("run_config")
+    if not isinstance(training_config, dict):
+        raise ValueError("checkpoint contains an invalid training_config")
+    if run_config is not None and not isinstance(run_config, dict):
+        raise ValueError("checkpoint contains an invalid run_config")
+    training_config = dict(training_config)
+    if format_version == 1:
+        training_config.setdefault("precision", "fp32")
+    if format_version <= 3:
+        training_config.setdefault("learning_rate_schedule", "cosine")
+        training_config.setdefault("decay_start_step", None)
+    if expected_run_config is None:
+        return training_config, run_config
+    if format_version == 1 and run_config is None:
+        warnings.warn(
+            "Legacy checkpoint has no run_config; cannot validate data, seed, batch, "
+            "or optimizer settings",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return training_config, expected_run_config
+    if run_config is not None:
+        run_config = dict(run_config)
+        if format_version <= 3:
+            run_config["data_contract_sha256"] = run_config.pop("manifest_sha256", None)
+            run_config["seed"] = expected_run_config["seed"]
+            warnings.warn(
+                "Legacy checkpoint has no seed in run_config; the seed cannot be validated",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        if format_version <= 4:
+            run_config.setdefault("compile_mode", None)
+            run_config["source_token_budgets"] = expected_run_config["source_token_budgets"]
+            if expected_run_config["source_token_budgets"] is not None:
+                warnings.warn(
+                    "Legacy checkpoint has no source token budgets; the configured "
+                    "mixture cannot be validated independently of its data contract digest",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+    return training_config, run_config
+
+
+def restore_checkpoint(
+    path: str | Path,
+    model: GPT,
+    optimizer: torch.optim.Optimizer,
+    training_config: TrainingConfig,
+    map_location: torch.device | str = "cpu",
+    run_config: TrainingRunConfig | None = None,
+) -> RestoredCheckpoint:
+    """Restore model, optimizer, random state, and run identity."""
+    checkpoint_path = Path(path)
+    payload = read_checkpoint_payload(checkpoint_path, map_location=map_location)
+    step = payload["step"]
+    expected_run_config = None if run_config is None else asdict(run_config)
+    saved_training_config, saved_run_config = _normalize_training_configs(
+        payload, expected_run_config
+    )
+
     model_state = payload.get("model_state")
     optimizer_state = payload.get("optimizer_state")
     torch_rng_state = payload.get("torch_rng_state")
     model_config = payload.get("model_config")
-    saved_training_config = payload.get("training_config")
     wandb_run_id = payload.get("wandb_run_id")
     wandb_project = payload.get("wandb_project")
     wandb_entity = payload.get("wandb_entity")
-    saved_run_config = payload.get("run_config")
     data_position = payload.get("data_position", 0)
     tokens_seen = payload.get("tokens_seen", 0)
     source_tokens_seen = payload.get("source_tokens_seen")
@@ -312,30 +383,13 @@ def restore_checkpoint(
     best_validation_loss = payload.get("best_validation_loss")
     cuda_rng_states = payload.get("cuda_rng_states")
     mps_rng_state = payload.get("mps_rng_state")
-    if not isinstance(model_state, dict):
-        raise ValueError("checkpoint contains an invalid model_state")
     if not isinstance(optimizer_state, dict):
         raise ValueError("checkpoint contains an invalid optimizer_state")
     if not isinstance(torch_rng_state, torch.Tensor):
         raise ValueError("checkpoint contains an invalid torch_rng_state")
-    if not isinstance(model_config, dict):
-        raise ValueError("checkpoint contains an invalid model_config")
-    if not isinstance(saved_training_config, dict):
-        raise ValueError("checkpoint contains an invalid training_config")
-    model_config = dict(model_config)
-    if format_version <= 6:
-        model_config.setdefault("n_kv_heads", None)
-    saved_training_config = dict(saved_training_config)
-    if format_version == 1:
-        saved_training_config.setdefault("precision", "fp32")
-    if format_version <= 3:
-        saved_training_config.setdefault("learning_rate_schedule", "cosine")
-        saved_training_config.setdefault("decay_start_step", None)
     wandb_run_id = _validate_optional_string(wandb_run_id, "checkpoint wandb_run_id")
     wandb_project = _validate_optional_string(wandb_project, "checkpoint wandb_project")
     wandb_entity = _validate_optional_string(wandb_entity, "checkpoint wandb_entity")
-    if saved_run_config is not None and not isinstance(saved_run_config, dict):
-        raise ValueError("checkpoint contains an invalid run_config")
     if cuda_rng_states is not None and (
         not isinstance(cuda_rng_states, list)
         or not all(isinstance(state, torch.Tensor) for state in cuda_rng_states)
@@ -362,43 +416,8 @@ def restore_checkpoint(
         raise ValueError(
             "checkpoint training_config does not match the current training configuration"
         )
-    expected_run_config = None if run_config is None else asdict(run_config)
-    if expected_run_config is not None:
-        if format_version == 1 and saved_run_config is None:
-            warnings.warn(
-                "Legacy checkpoint has no run_config; cannot validate data, seed, batch, "
-                "or optimizer settings",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        else:
-            normalized_run_config = None if saved_run_config is None else dict(saved_run_config)
-            if normalized_run_config is not None and format_version <= 3:
-                legacy_digest = normalized_run_config.pop("manifest_sha256", None)
-                normalized_run_config["data_contract_sha256"] = legacy_digest
-                normalized_run_config["seed"] = expected_run_config["seed"]
-                warnings.warn(
-                    "Legacy checkpoint has no seed in run_config; the seed cannot be validated",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            if normalized_run_config is not None and format_version <= 4:
-                normalized_run_config.setdefault("compile_mode", None)
-            if normalized_run_config is not None and format_version <= 4:
-                normalized_run_config["source_token_budgets"] = expected_run_config[
-                    "source_token_budgets"
-                ]
-                if expected_run_config["source_token_budgets"] is not None:
-                    warnings.warn(
-                        "Legacy checkpoint has no source token budgets; the configured "
-                        "mixture cannot be validated independently of its data contract digest",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-            if normalized_run_config != expected_run_config:
-                raise ValueError(
-                    "checkpoint run_config does not match the current run configuration"
-                )
+    if expected_run_config is not None and saved_run_config != expected_run_config:
+        raise ValueError("checkpoint run_config does not match the current run configuration")
     if step > training_config.max_steps:
         raise ValueError(
             "checkpoint step cannot exceed training_config.max_steps, "

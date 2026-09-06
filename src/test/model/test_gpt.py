@@ -8,6 +8,31 @@ from model.config import ModelConfig
 from model.gpt import GPT, GPTKVCache
 
 
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize(
+    ("input_ids", "message"),
+    [
+        (torch.ones(3, dtype=torch.long), "shape"),
+        (torch.ones(1, 3), "dtype"),
+        (torch.empty(0, 3, dtype=torch.long), "non-empty"),
+        (torch.empty(1, 0, dtype=torch.long), "non-empty"),
+        (torch.ones(1, 5, dtype=torch.long), "exceeds"),
+    ],
+)
+def test_cached_and_uncached_forward_validate_inputs_identically(input_ids, message, cached):
+    model = GPT(ModelConfig(vocab_size=8, d_model=8, n_layers=1, n_heads=2, max_seq_len=4))
+    forward = model.forward_with_cache if cached else model.forward
+    with pytest.raises(ValueError, match=message):
+        forward(input_ids)
+
+
+def test_cached_forward_counts_prefix_against_context_limit():
+    model = GPT(ModelConfig(vocab_size=8, d_model=8, n_layers=1, n_heads=2, max_seq_len=4))
+    _, cache = model.forward_with_cache(torch.ones(1, 4, dtype=torch.long))
+    with pytest.raises(ValueError, match="Sequence length 5 exceeds"):
+        model.forward_with_cache(torch.ones(1, 1, dtype=torch.long), cache)
+
+
 def test_gpt_converts_token_sequences_into_vocabulary_logits() -> None:
     config = ModelConfig(
         vocab_size=32,

@@ -1,3 +1,4 @@
+import warnings
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,62 @@ from training.checkpoint import (
     save_checkpoint,
 )
 from training.trainer import TrainingConfig, train_step
+
+
+@pytest.mark.parametrize("version", range(1, 8))
+def test_all_checkpoint_versions_preserve_model_and_run_contract(tmp_path: Path, version: int):
+    model = GPT(_tiny_model_config())
+    optimizer = torch.optim.AdamW(model.parameters())
+    config = TrainingConfig(max_steps=2)
+    run_config = TrainingRunConfig(
+        data_contract_sha256="a" * 64,
+        seed=42,
+        batch_size=2,
+        optimizer_name="AdamW",
+        optimizer_betas=(0.9, 0.95),
+        optimizer_weight_decay=0.1,
+        optimizer_eps=1e-8,
+    )
+    path = save_checkpoint(
+        tmp_path / "step_000001.pt",
+        model,
+        optimizer,
+        1,
+        config,
+        run_config=run_config,
+        tokens_seen=12,
+        data_position=2,
+    )
+    payload = torch.load(path, weights_only=True)
+    payload["format_version"] = version
+    if version <= 6:
+        payload["model_config"].pop("n_kv_heads")
+    if version == 1:
+        payload["training_config"].pop("precision")
+    if version <= 3:
+        payload["training_config"].pop("learning_rate_schedule")
+        payload["training_config"].pop("decay_start_step")
+        payload["run_config"]["manifest_sha256"] = payload["run_config"].pop("data_contract_sha256")
+        payload["run_config"].pop("seed")
+    if version <= 4:
+        payload["run_config"].pop("compile_mode")
+        payload["run_config"].pop("source_token_budgets")
+    torch.save(payload, path)
+    restored_model = GPT(_tiny_model_config())
+    restored_optimizer = torch.optim.AdamW(restored_model.parameters())
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        restored = restore_checkpoint(
+            path, restored_model, restored_optimizer, config, run_config=run_config
+        )
+    assert len(emitted) == (1 if version <= 3 else 0)
+    if emitted:
+        assert "has no seed" in str(emitted[0].message)
+    assert restored.step == 1
+    assert restored.tokens_seen == 12
+    assert restored.data_position == 2
+    for name, expected in model.state_dict().items():
+        assert torch.equal(restored_model.state_dict()[name], expected)
 
 
 def _tiny_model_config() -> ModelConfig:

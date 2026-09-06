@@ -120,6 +120,11 @@ fichero y `load_manifest()` lo verifica además del tamaño antes de abrir los d
 manifest v2 existentes siguen siendo legibles, pero no ofrecen esta comprobación porque
 nunca almacenaron checksums.
 
+El entrenamiento reutiliza el manifest validado durante la preparación de sus loaders:
+cada shard se verifica una sola vez por inicio del proceso, incluyendo los de validación.
+Los workers abren sus propios mapas de solo lectura al acceder a un shard; al serializar el
+dataset se transmiten metadatos, sin copiar los tokens completos a la memoria de cada worker.
+
 ## Inspeccionar el slicing
 
 ```bash
@@ -266,6 +271,8 @@ uv run mypy
 
 Los tests de red no forman parte de la suite. Las pruebas sustituyen la fuente remota por
 documentos pequeños y escriben shards reales en directorios temporales.
+Los cambios siguen TDD: primero una prueba que reproduzca el fallo o cobertura del comportamiento
+que se quiere conservar, después la implementación y la ejecución de las comprobaciones.
 
 ## Arquitectura de datos
 

@@ -65,3 +65,14 @@ def test_evaluation_checkpoint_rejects_an_unsupported_format(tmp_path: Path) -> 
 
     with pytest.raises(ValueError, match="Unsupported checkpoint format_version"):
         load_evaluation_checkpoint(checkpoint_path)
+
+
+def test_evaluation_checkpoint_rejects_mismatched_filename_step(tmp_path: Path) -> None:
+    model = GPT(ModelConfig(vocab_size=8, d_model=8, n_layers=1, n_heads=2))
+    optimizer = torch.optim.AdamW(model.parameters())
+    path = save_checkpoint(
+        tmp_path / "step_000001.pt", model, optimizer, 1, TrainingConfig(max_steps=2)
+    )
+    renamed = path.rename(tmp_path / "step_000002.pt")
+    with pytest.raises(ValueError, match="does not match payload step"):
+        load_evaluation_checkpoint(renamed)

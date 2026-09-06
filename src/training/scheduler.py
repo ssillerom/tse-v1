@@ -102,8 +102,6 @@ def get_wsd_learning_rate(
         return max_learning_rate
     if step >= max_steps:
         return 0.0
-    if decay_start_step == max_steps:
-        return max_learning_rate
     if decay_start_step == max_steps - 1:
         return 0.0
 

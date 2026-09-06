@@ -68,6 +68,8 @@ uv run mypy
 
 ## Change discipline
 
+- Use TDD: reproduce bugs with a failing regression test before fixing them, and add missing
+  behavior coverage before refactoring. Run the relevant tests after each change.
 - Test behavior through public data, model, training, checkpoint, and CLI entry points.
 - Use real temporary shard files in tests; do not mock NumPy memmap internals.
 - Keep network access out of the default test suite.

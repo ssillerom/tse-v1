@@ -1,13 +1,14 @@
 """Memory-mapped dataset for causal language-model pretraining."""
 
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from src.data.manifest import ManifestShard, load_manifest
+from src.data.manifest import DataManifest, load_manifest
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,15 @@ class ShardIndex:
     path: Path
     token_count: int
     sequence_count: int
-    tokens: np.memmap
+
+    @cached_property
+    def tokens(self) -> np.memmap:
+        """Open this process's read-only mapping on first use."""
+        return np.memmap(self.path, dtype=np.uint16, mode="r")
+
+    def __reduce__(self) -> tuple[type["ShardIndex"], tuple[Path, int, int]]:
+        # Spawn workers receive metadata, never a serialized copy of token bytes.
+        return type(self), (self.path, self.token_count, self.sequence_count)
 
 
 class PretrainingDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -25,22 +34,27 @@ class PretrainingDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
     def __init__(
         self,
-        manifest_path: str | Path,
+        manifest_path: str | Path | DataManifest,
         split: str,
         seq_len: int,
     ) -> None:
         self.split = split
 
-        # TODO 1: validate seq_len.
         self.seq_len = seq_len
         if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len <= 0:
             raise ValueError(f"seq_len must be a positive integer, got {seq_len!r}")
 
-        manifest = load_manifest(manifest_path)
+        manifest = (
+            manifest_path
+            if isinstance(manifest_path, DataManifest)
+            else load_manifest(manifest_path)
+        )
         split_shards = manifest.shards_for_split(split)
-        self.shards = [self._open_shard(shard) for shard in split_shards]
+        self.shards = [
+            ShardIndex(shard.path, shard.token_count, (shard.token_count - 1) // seq_len)
+            for shard in split_shards
+        ]
 
-        # TODO 7: build the cumulative sequence index.
         sequence_counts = np.array(
             [shard.sequence_count for shard in self.shards],
             dtype=np.int64,
@@ -59,46 +73,21 @@ class PretrainingDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return one input/target pair, both with shape [seq_len]."""
-        # TODO 8: check that the index is within bounds.
         if not isinstance(index, int) or index < 0 or index >= len(self):
             raise IndexError(f"Index {index} is out of range for dataset of length {len(self)}")
 
-        # TODO 9: locate the shard and local position.
         shard_idx, local_idx = self._locate_sequence(index)
 
-        # TODO 10: extract seq_len + 1 tokens.
         start = local_idx * self.seq_len
         tokens = self.shards[shard_idx].tokens[start : start + self.seq_len + 1]
 
-        # TODO 11: convert to torch.long.
         array = tokens.astype(np.int64, copy=True)
 
-        torch_tokens = torch.from_numpy(array).to(torch.long)
+        torch_tokens = torch.from_numpy(array)
 
-        # TODO 12: split input_ids and targets.
         input_ids = torch_tokens[: self.seq_len]
         target_ids = torch_tokens[1 : self.seq_len + 1]
         return input_ids, target_ids
-
-    def _open_shard(
-        self,
-        shard: ManifestShard,
-    ) -> ShardIndex:
-        """Memory-map one already validated manifest shard."""
-        tokens = np.memmap(
-            shard.path,
-            dtype=np.uint16,
-            mode="r",
-        )
-
-        sequence_count = (shard.token_count - 1) // self.seq_len
-
-        return ShardIndex(
-            path=shard.path,
-            token_count=shard.token_count,
-            sequence_count=sequence_count,
-            tokens=tokens,
-        )
 
     def _locate_sequence(self, index: int) -> tuple[int, int]:
         """Map a global sequence index to (shard_index, local_index)."""

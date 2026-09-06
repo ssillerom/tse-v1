@@ -27,6 +27,7 @@ from src.evaluation.harness_adapter import (
     GPT2HarnessAdapter,
     load_evaluation_checkpoint,
 )
+from src.runtime import resolve_device, resolve_precision
 
 DEFAULT_BASE_TASKS = (
     "lambada_openai",
@@ -97,28 +98,6 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_device(requested: str) -> torch.device:
-    if requested == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA was requested but is not available")
-    if requested == "mps" and not torch.backends.mps.is_available():
-        raise ValueError("MPS was requested but is not available")
-    return torch.device(requested)
-
-
-def _resolve_precision(requested: str, device: torch.device) -> str:
-    if requested == "auto":
-        return "bf16" if device.type == "cuda" and torch.cuda.is_bf16_supported() else "fp32"
-    if requested == "bf16" and device.type == "mps":
-        raise ValueError("bf16 evaluation is not supported on MPS")
-    return requested
-
-
 def _git_metadata() -> dict[str, object]:
     repository_root = Path(__file__).resolve().parents[2]
     commit = subprocess.run(
@@ -162,8 +141,8 @@ def main(
         raise ValueError("tasks must contain at least one task name")
     runtime = _load_harness_runtime() if harness_runtime is None else harness_runtime
 
-    device = _resolve_device(arguments.device)
-    precision = _resolve_precision(arguments.precision, device)
+    device = resolve_device(arguments.device)
+    precision = resolve_precision(arguments.precision, device)
     encoding = tiktoken.get_encoding(arguments.tokenizer)
     checkpoint = load_evaluation_checkpoint(arguments.checkpoint, device=device)
     adapter = GPT2HarnessAdapter(

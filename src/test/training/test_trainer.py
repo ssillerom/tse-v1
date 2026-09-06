@@ -29,6 +29,14 @@ def _tiny_model(dropout: float = 0.0) -> GPT:
     )
 
 
+def test_evaluation_does_not_fetch_past_its_batch_budget() -> None:
+    def batches():
+        yield torch.tensor([[1, 2, 3]]), torch.tensor([[2, 3, 4]])
+        raise RuntimeError("read past evaluation budget")
+
+    assert math.isfinite(evaluate(_tiny_model(), batches(), "cpu", max_batches=1))
+
+
 class AutocastRecordingGPT(GPT):
     def __init__(self) -> None:
         super().__init__(_tiny_model().config)
@@ -81,6 +89,22 @@ def test_training_config_accepts_a_complete_wsd_schedule() -> None:
 
     assert config.learning_rate_schedule == "wsd"
     assert config.decay_start_step == 8
+
+
+@pytest.mark.parametrize(
+    ("schedule", "expected"),
+    [("cosine", [0.1, 0.55, 1.0, 0.55, 0.1]), ("wsd", [0.0, 0.5, 1.0, 1.0, 0.0])],
+)
+def test_training_config_resolves_learning_rate_boundaries(schedule, expected):
+    config = TrainingConfig(
+        max_steps=10,
+        warmup_steps=2,
+        max_learning_rate=1.0,
+        min_learning_rate=0.1 if schedule == "cosine" else 0.0,
+        learning_rate_schedule=schedule,
+        decay_start_step=6 if schedule == "wsd" else None,
+    )
+    assert [config.learning_rate_at(step) for step in [0, 1, 2, 6, 10]] == pytest.approx(expected)
 
 
 def test_training_config_requires_a_decay_boundary_for_wsd() -> None:

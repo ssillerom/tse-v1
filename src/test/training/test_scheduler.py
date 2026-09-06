@@ -4,6 +4,14 @@ from training.scheduler import get_learning_rate, get_wsd_learning_rate
 
 
 @pytest.mark.parametrize(
+    ("warmup", "expected"), [(0, [1.0, 1.0, 1.0, 0.0]), (3, [0.0, 1 / 3, 2 / 3, 0.0])]
+)
+def test_wsd_with_no_decay_steps_preserves_warmup_and_stable_phase(warmup, expected):
+    rates = [get_wsd_learning_rate(step, warmup, 3, 3, 1.0) for step in range(4)]
+    assert rates == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
     ("step", "expected_learning_rate"),
     [
         (0, 0.1),
